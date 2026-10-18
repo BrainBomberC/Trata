@@ -1,0 +1,38 @@
+# bolt-serve.service —— llama-server（3 卡张量并行 + 1M 上下文）
+#
+# 安装:
+#   cp systemd/bolt-serve.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now bolt-serve.service
+#
+# 假设仓库在 ~/Nemotron3Super。换路径时改下面所有 %h/Nemotron3Super。
+# NCCL 路径按实际 python 版本调整（python3.12 / python3.11 …）。
+# 要启用视觉，在 ExecStart 末尾加:
+#   -mm %h/Nemotron3Super/model/mmproj-BF16.gguf --no-mmproj-offload
+
+[Unit]
+Description=Bolt 74B llama-server (TP 3x, 1M ctx)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Nemotron3Super
+Environment=LD_LIBRARY_PATH=%h/nccl-venv/lib/python3.12/site-packages/nvidia/nccl/lib:%h/Nemotron3Super/llama.cpp/build-nccl/bin
+Environment=LLAMA_SM_TENSOR_ALLOW_ARCH=1
+ExecStart=%h/Nemotron3Super/llama.cpp/build-nccl/bin/llama-server \
+  -m %h/Nemotron3Super/model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS-tpfit.gguf \
+  -ngl all -sm tensor -ts 1,1,1 -fa on \
+  -ctk q4_0 -ctv q4_0 -c 1048576 -ub 128 \
+  -t 17 -np 1 -fit off \
+  --override-kv nemotron_h_moe.context_length=int:1048576 \
+  --metrics --host 127.0.0.1 --port 8080 -lv 3
+
+# 宁可 OOM 报错，也不要静默换页导致 0.04 tok/s
+MemorySwapMax=0
+Restart=on-failure
+RestartSec=15
+# 冷缓存（USB2 盘）加载 22 GB 需要约 8 分钟
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=default.target

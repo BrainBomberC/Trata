@@ -1,0 +1,49 @@
+# ---- 模型权重：绝不进 git ----
+model/*
+!model/README.md
+*.gguf
+*.gguf.part*
+*.part-*
+*.safetensors
+*.bin.tmp
+
+# 下载/量化中间产物
+downloads/
+*.tpfit-types.txt
+*.tmp
+
+# llama.cpp 源码与构建目录（按文档自行克隆/编译）
+llama.cpp/
+build/
+build-*/
+cmake-build-*/
+
+# 运行产物
+*.pid
+*.log
+!benchmarks/logs/*.log
+!benchmarks/logs/*.txt
+logs/
+run/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# 本地配置与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key

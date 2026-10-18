@@ -1,0 +1,15 @@
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -1126,7 +1126,11 @@
+             metadata[i].target_type = tensor->type;
+         }
+ 
+-        metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
++        // 2026-10-18: 目标类型与现有类型相同时不会发生任何量化，不应强制要求 imatrix
++        //（否则混合精度文件里「原样保留 IQ2_XXS 专家」这种合法操作会被拒绝）
++        metadata[i].requires_imatrix = (metadata[i].target_type == tensor->type)
++            ? false
++            : tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
+ 
+         if (params->imatrix) {
+             metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped);

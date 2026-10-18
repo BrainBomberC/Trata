@@ -1,0 +1,25 @@
+# bolt-strata-ui.service —— Trata 网页 + API 代理（端口 8001）
+#
+# 安装:
+#   cp systemd/bolt-strata-ui.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now bolt-strata-ui.service
+#
+# 默认监听 0.0.0.0:8001（局域网可访问，无鉴权）。
+# 只要本机访问就把 --host 改成 127.0.0.1。
+
+[Unit]
+Description=Trata web UI and API proxy for llama-server
+After=bolt-serve.service
+Wants=bolt-serve.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Nemotron3Super
+ExecStart=/usr/bin/python3 -I %h/Nemotron3Super/scripts/serve-ui.py \
+  --host 0.0.0.0 --port 8001 --backend http://127.0.0.1:8080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

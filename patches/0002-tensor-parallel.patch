@@ -1,0 +1,1432 @@
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2537,6 +2537,29 @@
+             struct ggml_tensor  * ids,
+             int64_t               K);
+ 
++    // 只输出 y（形状同 x）/ 只输出新的 state（形状同 s）；用于张量并行切分
++    GGML_API struct ggml_tensor * ggml_ssm_scan_y(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * s,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * dt,
++        struct ggml_tensor  * A,
++        struct ggml_tensor  * B,
++        struct ggml_tensor  * C,
++        struct ggml_tensor  * ids,
++        int64_t               K);
++
++    GGML_API struct ggml_tensor * ggml_ssm_scan_state(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * s,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * dt,
++        struct ggml_tensor  * A,
++        struct ggml_tensor  * B,
++        struct ggml_tensor  * C,
++        struct ggml_tensor  * ids,
++        int64_t               K);
++
+     // partition into non-overlapping windows with padding if needed
+     // example:
+     // a:   768   64   64    1
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -99,6 +99,13 @@
+ 
+     GGML_API void ggml_backend_synchronize(ggml_backend_t backend);
+ 
++    // 2026-10-18: 整段捕获/回放（CUDA graph）。供 meta 后端把一整个 token 的
++    // 多个子图 + 集合通信收敛成每设备一次派发；不支持的后端返回 false。
++    GGML_API bool ggml_backend_capture_begin (ggml_backend_t backend);
++    GGML_API bool ggml_backend_capture_end   (ggml_backend_t backend, void ** exec);
++    GGML_API void ggml_backend_capture_launch(ggml_backend_t backend, void * exec);
++    GGML_API void ggml_backend_capture_free  (ggml_backend_t backend, void * exec);
++
+     GGML_API ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph);
+     GGML_API void                      ggml_backend_graph_plan_free  (ggml_backend_t backend, ggml_backend_graph_plan_t plan);
+ 
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5694,7 +5694,7 @@
+ 
+ // ggml_ssm_scan
+ 
+-struct ggml_tensor * ggml_ssm_scan(
++static struct ggml_tensor * ggml_ssm_scan_impl(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * s,
+         struct ggml_tensor  * x,
+@@ -5703,7 +5703,8 @@
+         struct ggml_tensor  * B,
+         struct ggml_tensor  * C,
+         struct ggml_tensor  * ids,
+-        int64_t               K) {
++        int64_t               K,
++        int32_t               mode) {
+     GGML_ASSERT(K >= 1);
+     GGML_ASSERT(K <= INT32_MAX);
+     GGML_ASSERT(ggml_is_contiguous(s));
+@@ -5746,8 +5747,20 @@
+         }
+     }
+ 
+-    // concatenated y + ssm_states
+-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + K*s->ne[0]*s->ne[1]*s->ne[2]*ids->ne[0]);
++    // GGML_SSM_SCAN_MODE_PACKED = 0: concatenated y + ssm_states (历史行为)
++    // GGML_SSM_SCAN_MODE_Y      = 1: 只输出 y，形状与 x 相同（便于张量并行按 head 轴切分）
++    // GGML_SSM_SCAN_MODE_STATE  = 2: 只输出新的 state，形状与 s 相同（需 K == 1）
++    struct ggml_tensor * result;
++    if (mode == 1) {
++        result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
++    } else if (mode == 2) {
++        GGML_ASSERT(K == 1);
++        // 新状态按「序列」紧凑存放（每个 ubatch 序列一份），与 s 的槽位数无关：
++        // s 是整张 cache 的视图（ne[3] = 槽位总数），而这里只回写 n_seqs 份。
++        result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, s->ne[0], s->ne[1], s->ne[2], x->ne[3]);
++    } else {
++        result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + K*s->ne[0]*s->ne[1]*s->ne[2]*ids->ne[0]);
++    }
+ 
+     result->op   = GGML_OP_SSM_SCAN;
+     result->src[0] = s;
+@@ -5759,10 +5772,52 @@
+     result->src[6] = ids;
+ 
+     ggml_set_op_params_i32(result, 0, (int32_t) K);
++    ggml_set_op_params_i32(result, 1, mode);
+ 
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_ssm_scan(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * s,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * dt,
++        struct ggml_tensor  * A,
++        struct ggml_tensor  * B,
++        struct ggml_tensor  * C,
++        struct ggml_tensor  * ids,
++        int64_t               K) {
++    return ggml_ssm_scan_impl(ctx, s, x, dt, A, B, C, ids, K, 0);
++}
++
++// 只返回 y（形状同 x）——用于张量并行：切分轴 = head 轴
++struct ggml_tensor * ggml_ssm_scan_y(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * s,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * dt,
++        struct ggml_tensor  * A,
++        struct ggml_tensor  * B,
++        struct ggml_tensor  * C,
++        struct ggml_tensor  * ids,
++        int64_t               K) {
++    return ggml_ssm_scan_impl(ctx, s, x, dt, A, B, C, ids, K, 1);
++}
++
++// 只返回新的 state（形状同 s）——用于张量并行：切分轴 = head 轴（s 的 ne[2]）
++struct ggml_tensor * ggml_ssm_scan_state(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * s,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * dt,
++        struct ggml_tensor  * A,
++        struct ggml_tensor  * B,
++        struct ggml_tensor  * C,
++        struct ggml_tensor  * ids,
++        int64_t               K) {
++    return ggml_ssm_scan_impl(ctx, s, x, dt, A, B, C, ids, K, 2);
++}
++
+ // ggml_win_part
+ 
+ struct ggml_tensor * ggml_win_part(
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -447,6 +447,13 @@
+     }
+ 
+     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
++    if (offset + (n_copies-1)*stride_tensor + size > ggml_nbytes(tensor)) {
++        fprintf(stderr, "[SET2D-DIAG] tensor='%s' type=%d ne=[%lld,%lld,%lld,%lld] offset=%zu size=%zu n_copies=%zu stride=%zu nbytes=%zu\n",
++                tensor->name, (int) tensor->type,
++                (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
++                offset, size, n_copies, stride_tensor, ggml_nbytes(tensor));
++        fflush(stderr);
++    }
+     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+     backend->iface.set_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+ }
+@@ -519,6 +526,13 @@
+     }
+ 
+     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
++    if (offset + (n_copies-1)*stride_tensor + size > ggml_nbytes(tensor)) {
++        fprintf(stderr, "[SET2D-DIAG] tensor='%s' type=%d ne=[%lld,%lld,%lld,%lld] offset=%zu size=%zu n_copies=%zu stride=%zu nbytes=%zu\n",
++                tensor->name, (int) tensor->type,
++                (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
++                offset, size, n_copies, stride_tensor, ggml_nbytes(tensor));
++        fflush(stderr);
++    }
+     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+ 
+     buf->iface.set_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+@@ -571,6 +585,37 @@
+     backend->iface.synchronize(backend);
+ }
+ 
++// 2026-10-18: 整段捕获/回放的通用封装（目前只有 CUDA 后端实现）
++bool ggml_backend_capture_begin(ggml_backend_t backend) {
++    GGML_ASSERT(backend);
++    if (backend->iface.capture_begin == NULL) {
++        return false;
++    }
++    return backend->iface.capture_begin(backend);
++}
++
++bool ggml_backend_capture_end(ggml_backend_t backend, void ** exec) {
++    GGML_ASSERT(backend);
++    if (backend->iface.capture_end == NULL) {
++        return false;
++    }
++    return backend->iface.capture_end(backend, exec);
++}
++
++void ggml_backend_capture_launch(ggml_backend_t backend, void * exec) {
++    GGML_ASSERT(backend);
++    GGML_ASSERT(backend->iface.capture_launch != NULL);
++    backend->iface.capture_launch(backend, exec);
++}
++
++void ggml_backend_capture_free(ggml_backend_t backend, void * exec) {
++    GGML_ASSERT(backend);
++    if (backend->iface.capture_free == NULL) {
++        return;
++    }
++    backend->iface.capture_free(backend, exec);
++}
++
+ ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+     GGML_ASSERT(backend);
+     GGML_ASSERT(backend->iface.graph_plan_create != NULL);
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -154,6 +154,14 @@
+ 
+         // (optional) sort/optimize the nodes in the graph
+         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
++
++        // 2026-10-18: (optional) 整段捕获/回放。meta 后端把一个 token 的所有子图
++        // （含 NCCL 归约）捕获成每设备一张 CUDA graph，避免每个子图边界都回到 host。
++        // 返回 false 表示不支持，调用方回退到逐子图执行。
++        bool (*capture_begin) (ggml_backend_t backend);
++        bool (*capture_end)   (ggml_backend_t backend, void ** exec);
++        void (*capture_launch)(ggml_backend_t backend, void * exec);
++        void (*capture_free)  (ggml_backend_t backend, void * exec);
+     };
+ 
+     struct ggml_backend {
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <chrono>
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+@@ -18,6 +19,7 @@
+ #include <tuple>
+ #include <utility>
+ #include <vector>
++#include <unistd.h>
+ 
+ struct ggml_backend_meta_device;
+ struct ggml_backend_meta_buffer_type;
+@@ -519,6 +521,22 @@
+         return true;
+     };
+ 
++    auto dump_ss = [&](const char * tag, const ggml_tensor * t, const ggml_backend_meta_split_state & ss) {
++        fprintf(stderr, "[SS-DUMP] %s name='%s' ne=[%lld,%lld,%lld,%lld] axis=%d nseg=%u",
++                tag, t != nullptr ? t->name : "-",
++                t != nullptr ? (long long) t->ne[0] : -1, t != nullptr ? (long long) t->ne[1] : -1,
++                t != nullptr ? (long long) t->ne[2] : -1, t != nullptr ? (long long) t->ne[3] : -1,
++                (int) ss.axis, (unsigned) ss.n_segments);
++        for (size_t s = 0; s < ss.n_segments; s++) {
++            fprintf(stderr, " seg%zu:nr=%u ne=[", s, (unsigned) ss.nr[s]);
++            for (size_t j = 0; j < n_bufs; j++) {
++                fprintf(stderr, "%lld%s", (long long) ss.ne[s*n_bufs + j], j + 1 < n_bufs ? "," : "");
++            }
++            fprintf(stderr, "]");
++        }
++        fprintf(stderr, "\n");
++        fflush(stderr);
++    };
+     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
+         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
+         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+@@ -538,6 +556,22 @@
+         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
+             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+         }
++        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
++            fprintf(stderr, "[OP-DIAG] op=%d name='%s' ne=[%lld,%lld,%lld,%lld] type=%d src0='%s'(axis=%d) src1='%s'(axis=%d) src2='%s'(axis=%d)\n",
++                    (int) tensor->op, tensor->name,
++                    (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
++                    (int) tensor->type,
++                    tensor->src[0] ? tensor->src[0]->name : "-", (int) src_ss[0].axis,
++                    tensor->src[1] ? tensor->src[1]->name : "-", (int) src_ss[1].axis,
++                    tensor->src[2] ? tensor->src[2]->name : "-", (int) src_ss[2].axis);
++            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
++                if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
++                    continue;
++                }
++                dump_ss(("src" + std::to_string(i)).c_str(), tensor->src[i], src_ss[i]);
++            }
++            fflush(stderr);
++        }
+         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+         return ret;
+     };
+@@ -665,6 +699,47 @@
+         }
+     };
+ 
++    // 2026-10-18: SSM scan 的各个源把「头」放在不同轴上：
++    //   s   [d_state, head_dim, n_head, slots]  axis 2
++    //   x   [head_dim, n_head, n_tok, n_seqs]   axis 1
++    //   dt  [n_head, n_tok, n_seqs]             axis 0
++    //   A   [1, n_head]                         axis 1
++    //   B/C [d_state, n_group, n_tok, n_seqs]   axis 1（组）
++    // 只要每张卡拿到的头（组）数一致，scan 就完全在卡内完成。
++    auto handle_ssm_scan = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
++        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
++            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
++        }
++        const int32_t mode = ggml_get_op_params_i32(tensor, 1);
++        GGML_ASSERT(mode == 1 || mode == 2);
++        const int64_t n_head  = tensor->src[1]->ne[1];
++        const int64_t n_group = tensor->src[4]->ne[1];
++        GGML_ASSERT(n_group > 0 && n_head % n_group == 0);
++        const int64_t hpg = n_head / n_group;
++        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
++        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
++        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_0);
++        GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_1);
++        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_1);
++        GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1);
++        for (size_t i = 0; i < 6; i++) {
++            GGML_ASSERT(src_ss[i].n_segments == 1 && src_ss[i].nr[0] == 1);
++        }
++        for (size_t j = 0; j < n_bufs; j++) {
++            const int64_t h0 = src_ss[0].ne[j];
++            if (src_ss[1].ne[j] != h0 || src_ss[2].ne[j] != h0 || src_ss[3].ne[j] != h0 ||
++                    src_ss[4].ne[j]*hpg != h0 || src_ss[5].ne[j]*hpg != h0) {
++                fprintf(stderr, "[SCAN-DIAG] head split mismatch on device %zu: s=%lld x=%lld dt=%lld A=%lld B=%lld C=%lld hpg=%lld\n",
++                        j, (long long) src_ss[0].ne[j], (long long) src_ss[1].ne[j], (long long) src_ss[2].ne[j],
++                        (long long) src_ss[3].ne[j], (long long) src_ss[4].ne[j], (long long) src_ss[5].ne[j], (long long) hpg);
++                fflush(stderr);
++            }
++            GGML_ASSERT(src_ss[1].ne[j] == h0 && src_ss[2].ne[j] == h0 && src_ss[3].ne[j] == h0);
++            GGML_ASSERT(src_ss[4].ne[j]*hpg == h0 && src_ss[5].ne[j]*hpg == h0);
++        }
++        return {mode == 1 ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
++    };
++
+     auto handle_cpy = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
+             return handle_reshape(src_ss);
+@@ -844,6 +919,13 @@
+                 int64_t ne_sum = 0;
+                 for (size_t s = 0; s < ret.n_segments; s++) {
+                     for (size_t j = 0; j < n_bufs; j++) {
++                        if (ret.ne[s*n_bufs + j] % granularity != 0) {
++                            fprintf(stderr, "[SPLIT-DIAG] tensor='%s' type=%d axis=%d seg=%zu/%d ne=%lld granularity=%lld ne0=%lld ne1=%lld ne2=%lld ne3=%lld\n",
++                                    tensor->name, (int) tensor->type, (int) ret.axis, s, n_bufs,
++                                    (long long) ret.ne[s*n_bufs + j], (long long) granularity,
++                                    (long long) tensor->ne[0], (long long) tensor->ne[1],
++                                    (long long) tensor->ne[2], (long long) tensor->ne[3]);
++                        }
+                         GGML_ASSERT(ret.ne[s*n_bufs + j] % granularity == 0);
+                         ne_sum += ret.ne[s*n_bufs + j] * ret.nr[s];
+                     }
+@@ -1027,7 +1109,9 @@
+             case GGML_OP_SSM_CONV: {
+                 split_state = handle_ssm_conv(src_ss);
+             } break;
+-            case GGML_OP_SSM_SCAN:
++            case GGML_OP_SSM_SCAN: {
++                split_state = handle_ssm_scan(src_ss);
++            } break;
+             case GGML_OP_WIN_PART:
+             case GGML_OP_WIN_UNPART:
+             case GGML_OP_GET_REL_POS:
+@@ -1092,7 +1176,16 @@
+                         split_state.ne[j] *= tensor->ne[split_state.axis];
+                         if (split_state.ne[j] != 0 || tensor->src[i]->ne[src_ss[i].axis] != 0) {
+                             const int64_t div = tensor->src[i]->ne[src_ss[i].axis] * split_state.nr[0];
+-                            GGML_ASSERT(split_state.ne[j] % div == 0);
++                            if (div != 0 && split_state.ne[j] % div != 0) {
++                                fprintf(stderr, "[DIV-DIAG] op=%d name='%s' ne=[%lld,%lld,%lld,%lld] src='%s' src_axis=%d src_ne_axis=%lld nr0=%lld ne_j=%lld div=%lld\n",
++                                        (int) tensor->op, tensor->name,
++                                        (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
++                                        tensor->src[i]->name, (int) src_ss[i].axis,
++                                        (long long) tensor->src[i]->ne[src_ss[i].axis], (long long) split_state.nr[0],
++                                        (long long) split_state.ne[j], (long long) div);
++                                fflush(stderr);
++                            }
++                            GGML_ASSERT(div == 0 || split_state.ne[j] % div == 0);
+                             split_state.ne[j] /= div;
+                         }
+                     }
+@@ -1836,6 +1929,15 @@
+     void *                               comm_ctx       = nullptr;
+     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+ 
++    // 2026-10-18: 整段捕获状态（GGML_META_GRAPH_CAPTURE=1 时启用）。
++    // 把一个 token 的全部子图 + NCCL 归约捕获成每设备一张 CUDA graph，
++    // 之后每 token 只需每设备一次派发，host 不再参与子图编排。
++    bool                 cap_enabled = getenv("GGML_META_GRAPH_CAPTURE") != nullptr;
++    bool                 cap_valid   = false;
++    uint64_t             cap_key     = 0;
++    int                  cap_warmup  = 0;
++    std::vector<void *>  cap_exec;
++
+     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
+         n_reduce_steps = std::ceil(std::log2(n_devs));
+@@ -1854,7 +1956,8 @@
+         }
+         name += ")";
+ 
+-        if (n_devs > 1) {
++        // 2026-10-18: GGML_META_NO_NCCL=1 → 不初始化 NCCL，改走下面的蝴蝶归约回退路径（用于对比）
++        if (n_devs > 1 && getenv("GGML_META_NO_NCCL") == nullptr) {
+             ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
+                 ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
+             if (comm_init != nullptr) {
+@@ -1993,6 +2096,24 @@
+ }
+ 
+ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
++    // 2026-10-18: GGML_META_TS=1 时统计 host 侧提交耗时（不阻塞 GPU）
++    struct ts_guard_t {
++        std::chrono::steady_clock::time_point t0;
++        bool on;
++        ~ts_guard_t() {
++            if (!on) { return; }
++            const double ms = std::chrono::duration<double, std::milli>(
++                    std::chrono::steady_clock::now() - t0).count();
++            static long   n_calls = 0;
++            static double sum_ms  = 0.0;
++            n_calls++;
++            sum_ms += ms;
++            if (n_calls % 128 == 0) {
++                fprintf(stderr, "[META-TS] calls=%ld avg_host_ms=%.3f\n", n_calls, sum_ms/n_calls);
++                fflush(stderr);
++            }
++        }
++    } ts_guard{std::chrono::steady_clock::now(), getenv("GGML_META_TS") != nullptr};
+     GGML_ASSERT(cgraph->grads == nullptr);
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+@@ -2258,6 +2379,36 @@
+ 
+         backend_ctx->uid         = cgraph->uid;
+         backend_ctx->n_subgraphs = n_subgraphs;
++        if (getenv("GGML_META_OPSEQ")) {
++            // 输出 device 0 每个子图里的算子顺序（一行一个子图），用于分析可融合的相邻算子对
++            auto & bcj0 = backend_ctx->backend_configs[0];
++            for (size_t i = 0; i < n_subgraphs; i++) {
++                ggml_cgraph * cg = bcj0.cgraphs[i].cgraph_main;
++                fprintf(stderr, "[OPSEQ] ");
++                for (int k = 0; k < cg->n_nodes; k++) {
++                    fprintf(stderr, "%s ", ggml_op_name(cg->nodes[k]->op));
++                }
++                fprintf(stderr, "\n");
++            }
++            fflush(stderr);
++        }
++        if (getenv("GGML_META_SUBGRAPH_PRINT")) {
++            fprintf(stderr, "[SUBGRAPH] n_subgraphs=%zu n_nodes=%d n_backends=%zu\n",
++                    n_subgraphs, cgraph->n_nodes, n_backends);
++            std::map<std::string, int> hist;
++            for (size_t j = 0; j < n_backends; j++) {
++                auto & bcj = backend_ctx->backend_configs[j];
++                if (j == 0) {
++                    for (size_t i = 0; i < cgraph->n_nodes; i++) {
++                        hist[ggml_op_name(bcj.nodes[i]->op)]++;
++                    }
++                }
++            }
++            for (const auto & kv : hist) {
++                fprintf(stderr, "[OPHIST] %-24s %d\n", kv.first.c_str(), kv.second);
++            }
++            fflush(stderr);
++        }
+ 
+         if (max_tmp_size > backend_ctx->max_tmp_size) {
+             for (size_t j = 0; j < n_backends; j++) {
+@@ -2466,9 +2617,17 @@
+     };
+ 
+ 
++    // 2026-10-18: GGML_META_HOST_DELAY_US=N —— 给每次子图派发人为加 N 微秒，
++    // 用来判断 host 提交是否在关键路径上（加多少时间就看总时间涨多少）。
++    static const int host_delay_us = getenv("GGML_META_HOST_DELAY_US") ? atoi(getenv("GGML_META_HOST_DELAY_US")) : 0;
++
++    auto execute_all_subgraphs = [&]() -> ggml_status {
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+         for (size_t j = 0; j < n_backends; j++) {
+             auto & bcj = backend_ctx->backend_configs[j];
++            if (host_delay_us > 0) {
++                usleep(host_delay_us);
++            }
+             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+             if (status != GGML_STATUS_SUCCESS) {
+                 return status;
+@@ -2497,6 +2656,203 @@
+         }
+     }
+     return GGML_STATUS_SUCCESS;
++    };
++
++    if (backend_ctx->cap_enabled) {
++        // FNV-1a：节点指针 / data 指针 / op 任一变化都必须重捕
++        uint64_t key = 1469598103934665603ull;
++        auto mix = [&key](uint64_t v) { key ^= v; key *= 1099511628211ull; };
++        mix(n_backends);
++        mix(backend_ctx->n_subgraphs);
++        for (size_t j = 0; j < n_backends; j++) {
++            auto & bcj = backend_ctx->backend_configs[j];
++            for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
++                ggml_cgraph * cg = bcj.cgraphs[i].cgraph_main;
++                mix((uint64_t) cg->n_nodes);
++                for (int k = 0; k < cg->n_nodes; k++) {
++                    // 注意：llama.cpp 每个 token 都会重建 ggml_tensor 对象（节点指针会变），
++                    // 但底层 data 缓冲与形状不变。CUDA graph 只依赖 data 指针与形状。
++                    const ggml_tensor * node = cg->nodes[k];
++                    mix((uint64_t) (uintptr_t) node->data);
++                    mix((uint64_t) node->op);
++                    mix((uint64_t) node->ne[0]);
++                    mix((uint64_t) node->ne[1]);
++                    mix((uint64_t) node->type);
++                }
++            }
++        }
++
++        if (getenv("GGML_META_GRAPH_CAPTURE_DEBUG")) {
++            static uint64_t last_key = 0;
++            static int n_dbg = 0;
++            if (key != last_key || n_dbg < 40) {
++                fprintf(stderr, "[META-CAP] key=%016llx warmup=%d valid=%d nsub=%zu sizes=[",
++                        (unsigned long long) key, backend_ctx->cap_warmup, (int) backend_ctx->cap_valid,
++                        backend_ctx->n_subgraphs);
++                for (size_t i = 0; i < backend_ctx->n_subgraphs && i < 6; i++) {
++                    ggml_cgraph * cg = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
++                    fprintf(stderr, "%d ", cg->n_nodes);
++                }
++                fprintf(stderr, "]");
++                fflush(stderr);
++                n_dbg++;
++            }
++            last_key = key;
++
++            // 找出到底哪个节点的 data 指针在变
++            static std::vector<std::pair<const void *, const void *>> prev_nodes;
++            std::vector<std::pair<const void *, const void *>> cur;
++            for (size_t j = 0; j < n_backends; j++) {
++                auto & bcj = backend_ctx->backend_configs[j];
++                for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
++                    ggml_cgraph * cg = bcj.cgraphs[i].cgraph_main;
++                    for (int k = 0; k < cg->n_nodes; k++) {
++                        cur.emplace_back(cg->nodes[k], cg->nodes[k]->data);
++                    }
++                }
++            }
++            if (prev_nodes.empty()) {
++                prev_nodes = cur;
++            } else {
++                static std::vector<std::array<int64_t, 5>> prev_shape;
++                std::vector<std::array<int64_t, 5>> cur_shape;
++                cur_shape.reserve(cur.size());
++                for (const auto & p : cur) {
++                    const ggml_tensor * t = (const ggml_tensor *) p.first;
++                    cur_shape.push_back({t->ne[0], t->ne[1], t->ne[2], t->ne[3], (int64_t) t->op});
++                }
++                if (prev_shape.size() == cur_shape.size()) {
++                    size_t shown_shape = 0;
++                    for (size_t idx = 0; idx < cur_shape.size() && shown_shape < 3; idx++) {
++                        if (prev_shape[idx] != cur_shape[idx]) {
++                            const ggml_tensor * t = (const ggml_tensor *) cur[idx].first;
++                            fprintf(stderr, "[META-CAP] SHAPE-DIFF idx=%zu '%s' op=%s [%lld,%lld,%lld,%lld] -> [%lld,%lld,%lld,%lld]\n",
++                                    idx, t->name, ggml_op_name(t->op),
++                                    (long long) prev_shape[idx][0], (long long) prev_shape[idx][1],
++                                    (long long) prev_shape[idx][2], (long long) prev_shape[idx][3],
++                                    (long long) cur_shape[idx][0], (long long) cur_shape[idx][1],
++                                    (long long) cur_shape[idx][2], (long long) cur_shape[idx][3]);
++                            fflush(stderr);
++                            shown_shape++;
++                        }
++                    }
++                }
++                prev_shape = cur_shape;
++
++                size_t shown = 0, n_data_diff = 0, first_data_idx = (size_t) -1;
++                for (size_t idx = 0; idx < cur.size() && idx < prev_nodes.size(); idx++) {
++                    if (prev_nodes[idx].second != cur[idx].second) {
++                        n_data_diff++;
++                        if (first_data_idx == (size_t) -1) {
++                            first_data_idx = idx;
++                            if (shown < 3) {
++                                const ggml_tensor * t = (const ggml_tensor *) cur[idx].first;
++                                fprintf(stderr, "[META-CAP] DATA-DIFF idx=%zu data %p->%p node='%s' op=%s\n", idx,
++                                        prev_nodes[idx].second, cur[idx].second,
++                                        t->name, ggml_op_name(t->op));
++                                fflush(stderr);
++                                shown++;
++                            }
++                        }
++                    }
++                }
++                if (cur.size() != prev_nodes.size()) {
++                    fprintf(stderr, "[META-CAP] SIZE-DIFF %zu -> %zu\n", prev_nodes.size(), cur.size());
++                    fflush(stderr);
++                } else if (n_data_diff == 0) {
++                    static int n_same = 0;
++                    if (n_same++ < 3) {
++                        fprintf(stderr, "[META-CAP] no data/nodes change, but key changed (n=%zu)\n", cur.size());
++                        fflush(stderr);
++                    }
++                }
++                prev_nodes = cur;
++            }
++        }
++
++        if (backend_ctx->cap_exec.size() != n_backends) {
++            backend_ctx->cap_exec.assign(n_backends, nullptr);
++        }
++        if (backend_ctx->cap_valid && backend_ctx->cap_key == key) {
++            for (size_t j = 0; j < n_backends; j++) {
++                ggml_backend_capture_launch(backend_ctx->backend_configs[j].backend, backend_ctx->cap_exec[j]);
++            }
++            return GGML_STATUS_SUCCESS;
++        }
++
++        for (size_t j = 0; j < n_backends; j++) {
++            if (backend_ctx->cap_exec[j] != nullptr) {
++                ggml_backend_capture_free(backend_ctx->backend_configs[j].backend, backend_ctx->cap_exec[j]);
++                backend_ctx->cap_exec[j] = nullptr;
++            }
++        }
++        backend_ctx->cap_valid = false;
++        if (backend_ctx->cap_key != key) {
++            backend_ctx->cap_warmup = 0;
++        }
++        backend_ctx->cap_key = key;
++
++        // 先普通执行几次，让显存池/临时缓冲预热（捕获期间不允许 cudaMalloc）
++        if (backend_ctx->cap_warmup < 3) {
++            backend_ctx->cap_warmup++;
++            return execute_all_subgraphs();
++        }
++
++        size_t j_begun = 0;
++        bool cap_ok = true;
++        for (; j_begun < n_backends; j_begun++) {
++            if (!ggml_backend_capture_begin(backend_ctx->backend_configs[j_begun].backend)) {
++                cap_ok = false;
++                break;
++            }
++        }
++        if (!cap_ok) {
++            for (size_t j = 0; j < j_begun; j++) {
++                void * dummy = nullptr;
++                ggml_backend_capture_end(backend_ctx->backend_configs[j].backend, &dummy);
++                if (dummy != nullptr) {
++                    ggml_backend_capture_free(backend_ctx->backend_configs[j].backend, dummy);
++                }
++            }
++            backend_ctx->cap_enabled = false;
++            return execute_all_subgraphs();
++        }
++
++        // 捕获阶段只是记录，不执行
++        const ggml_status st = execute_all_subgraphs();
++        bool end_ok = true;
++        for (size_t j = 0; j < n_backends; j++) {
++            void * exec = nullptr;
++            const bool ok_j = ggml_backend_capture_end(backend_ctx->backend_configs[j].backend, &exec);
++            end_ok = end_ok && ok_j;
++            backend_ctx->cap_exec[j] = exec;
++        }
++
++        if (st != GGML_STATUS_SUCCESS || !end_ok) {
++            for (size_t j = 0; j < n_backends; j++) {
++                if (backend_ctx->cap_exec[j] != nullptr) {
++                    ggml_backend_capture_free(backend_ctx->backend_configs[j].backend, backend_ctx->cap_exec[j]);
++                    backend_ctx->cap_exec[j] = nullptr;
++                }
++            }
++            backend_ctx->cap_enabled = false;
++            return execute_all_subgraphs();
++        }
++
++        backend_ctx->cap_valid = true;
++        if (getenv("GGML_META_GRAPH_CAPTURE_DEBUG")) {
++            fprintf(stderr, "[META-CAP] captured n_subgraphs=%zu n_nodes=%d\n",
++                    backend_ctx->n_subgraphs, cgraph->n_nodes);
++            fflush(stderr);
++        }
++        // 捕获不执行，立刻派发一次完成本 token
++        for (size_t j = 0; j < n_backends; j++) {
++            ggml_backend_capture_launch(backend_ctx->backend_configs[j].backend, backend_ctx->cap_exec[j]);
++        }
++        return GGML_STATUS_SUCCESS;
++    }
++
++    return execute_all_subgraphs();
+ }
+ 
+ static const ggml_backend_i ggml_backend_meta_i = {
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -92,6 +92,9 @@
+ #include <string>
+ #include <vector>
+ 
++// 2026-10-18: 外层的整段捕获深度（>0 时子图内部不再自己捕获，避免嵌套捕获）
++static thread_local int g_capture_depth = 0;
++
+ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+ 
+ #define GGML_LOG_WARN_ONCE(str) \
+@@ -998,6 +1001,27 @@
+ static bool ggml_backend_cuda_comm_allreduce_nccl(
+         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+     const int64_t ne = ggml_nelements(tensors[0]);
++
++    // 2026-10-18: 张量并行的通信开销诊断开关
++    //   GGML_TP_NO_REDUCE=1  → 跳过归约（输出错误，只用于测量通信占比）
++    //   GGML_TP_AR_STATS=1   → 每 100 次 allreduce 打印一次累计次数/元素数
++    {
++        static const bool skip_reduce = getenv("GGML_TP_NO_REDUCE") != nullptr;
++        static const bool ar_stats    = getenv("GGML_TP_AR_STATS")    != nullptr;
++        static std::atomic<int64_t> ar_calls{0};
++        static std::atomic<int64_t> ar_elems{0};
++        if (ar_stats) {
++            const int64_t c = ++ar_calls;
++            ar_elems += ne;
++            if (c % 100 == 0) {
++                fprintf(stderr, "[AR] calls=%lld elems=%lld\n", (long long) c, (long long) ar_elems.load());
++                fflush(stderr);
++            }
++        }
++        if (skip_reduce) {
++            return true;
++        }
++    }
+     // FIXME the input of llm_graph_context::build_in_out_ids can produce a tensor with 0 elements if n_outputs == 0
+     // This then causes a crash in this function
+     if (ne == 0) {
+@@ -2148,6 +2172,12 @@
+ }
+ 
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
++    // 2026-10-18: 成本测量用——GGML_CUDA_SKIP_OP=<op名> 时整类算子直接跳过（输出无意义，只测时间）
++    if (const char * skip_op = getenv("GGML_CUDA_SKIP_OP")) {
++        if (strcmp(skip_op, ggml_op_name(dst->op)) == 0) {
++            return true;
++        }
++    }
+     switch (dst->op) {
+         case GGML_OP_ARGMAX:
+             ggml_cuda_argmax(ctx, dst);
+@@ -4606,6 +4636,13 @@
+             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+         }
+         // Launch graph
++        if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
++            static int n_launch = 0;
++            if (n_launch++ % 64 == 0) {
++                fprintf(stderr, "[CUDA-GRAPH] replay #%d dev=%d\n", n_launch, cuda_ctx->device);
++                fflush(stderr);
++            }
++        }
+         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+ #else
+         GGML_UNUSED(graph_key);
+@@ -4646,8 +4683,15 @@
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
++    if (g_capture_depth == 0 && graph->is_enabled()) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
++        if (getenv("GGML_CUDA_GRAPH_DEBUG") && !graph_compatible) {
++            static int n_inc = 0;
++            if (n_inc++ < 6) {
++                fprintf(stderr, "[CUDA-GRAPH] incompatible dev=%d nodes=%d\n", cuda_ctx->device, cgraph->n_nodes);
++                fflush(stderr);
++            }
++        }
+         if (graph_compatible) {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+ 
+@@ -4676,6 +4720,10 @@
+ #endif // USE_CUDA_GRAPH
+ 
+     if (use_cuda_graph && cuda_graph_update_required) {
++        if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
++            fprintf(stderr, "[CUDA-GRAPH] capture dev=%d nodes=%d\n", cuda_ctx->device, cgraph->n_nodes);
++            fflush(stderr);
++        }
+         // Start CUDA graph capture
+         {
+             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+@@ -4687,6 +4735,19 @@
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+ 
++    // 2026-10-18: 外层捕获期间定位第一个失败的 op
++    if (g_capture_depth > 0 && getenv("GGML_META_GRAPH_CAPTURE_DEBUG")) {
++        const cudaError_t err = cudaGetLastError();
++        if (err != cudaSuccess) {
++            const ggml_tensor * t0 = cgraph->n_nodes > 0 ? cgraph->nodes[0] : nullptr;
++            fprintf(stderr, "[CAP-ERR] dev=%d nodes=%d first='%s' op=%s err=%s\n",
++                    cuda_ctx->device, cgraph->n_nodes,
++                    t0 ? t0->name : "-", t0 ? ggml_op_name(t0->op) : "-",
++                    cudaGetErrorString(err));
++            fflush(stderr);
++        }
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -5071,6 +5132,51 @@
+     }
+ }
+ 
++// 2026-10-18: 整段捕获（一个 token 的所有子图 + NCCL 归约 → 每设备一张 CUDA graph）。
++// g_capture_depth 在文件顶部声明；捕获期间屏蔽子图内部自己的捕获（嵌套捕获非法）。
++static bool ggml_backend_cuda_capture_begin(ggml_backend_t backend) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    // Relaxed：允许捕获期间出现 cudaMalloc 之类的调用（不会被记录，但不会破坏捕获）
++    if (cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed) != cudaSuccess) {
++        return false;
++    }
++    g_capture_depth++;
++    return true;
++}
++
++static bool ggml_backend_cuda_capture_end(ggml_backend_t backend, void ** exec) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    cudaGraph_t graph = nullptr;
++    if (cudaStreamEndCapture(cuda_ctx->stream(), &graph) != cudaSuccess || graph == nullptr) {
++        g_capture_depth = std::max(0, g_capture_depth - 1);
++        return false;
++    }
++    cudaGraphExec_t graph_exec = nullptr;
++    const cudaError_t err = cudaGraphInstantiate(&graph_exec, graph, 0);
++    cudaGraphDestroy(graph);
++    g_capture_depth = std::max(0, g_capture_depth - 1);
++    if (err != cudaSuccess) {
++        return false;
++    }
++    *exec = (void *) graph_exec;
++    return true;
++}
++
++static void ggml_backend_cuda_capture_launch(ggml_backend_t backend, void * exec) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    CUDA_CHECK(cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream()));
++}
++
++static void ggml_backend_cuda_capture_free(ggml_backend_t backend, void * exec) {
++    GGML_UNUSED(backend);
++    if (exec != nullptr) {
++        CUDA_CHECK(cudaGraphExecDestroy((cudaGraphExec_t) exec));
++    }
++}
++
+ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .get_name                = */ ggml_backend_cuda_get_name,
+     /* .free                    = */ ggml_backend_cuda_free,
+@@ -5088,6 +5194,10 @@
+     /* .event_record            = */ ggml_backend_cuda_event_record,
+     /* .event_wait              = */ ggml_backend_cuda_event_wait,
+     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
++    /* .capture_begin           = */ ggml_backend_cuda_capture_begin,
++    /* .capture_end             = */ ggml_backend_cuda_capture_end,
++    /* .capture_launch          = */ ggml_backend_cuda_capture_launch,
++    /* .capture_free            = */ ggml_backend_cuda_capture_free,
+ };
+ 
+ static ggml_guid_t ggml_backend_cuda_guid() {
+--- a/ggml/src/ggml-cuda/ssm-scan.cu
++++ b/ggml/src/ggml-cuda/ssm-scan.cu
+@@ -38,7 +38,7 @@
+                  const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3,
+                  const int src2_nb1, const int src2_nb2, const int src3_nb1,
+                  const int src4_nb2, const int src4_nb3, const int src5_nb2, const int src5_nb3,
+-                 const int64_t s_off, const int64_t d_inner, const int64_t L_param)
++                 const int64_t s_off, const int64_t d_inner, const int64_t L_param, const int mode)
+ {
+     const float   * GGML_CUDA_RESTRICT src0 = src0_ptr;
+     const float   * GGML_CUDA_RESTRICT src1 = src1_ptr;
+@@ -120,10 +120,11 @@
+             sumf += state * smemC[n];
+             regs0[n] = state;
+         }
+-        y_block[i * stride_y + threadIdx.x] = sumf;
++        if (mode != 2) { y_block[i * stride_y + threadIdx.x] = sumf; }
+         __syncthreads();
+     }
+ 
++    if (mode == 1) { return; }
+ #ifdef USE_CUB
+     BlockStore(cub_temp_storage.store_temp).Store(s_block, regs0);
+ #else
+@@ -149,7 +150,7 @@
+         const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3,
+         const int src2_nb1, const int src2_nb2, const int src3_nb1,
+         const int src4_nb2, const int src4_nb3, const int src5_nb2, const int src5_nb3,
+-        char * s_base, const int64_t s_slot_bytes, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok, const int64_t K) {
++        char * s_base, const int64_t s_slot_bytes, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok, const int64_t K, const int mode) {
+     const float   * GGML_CUDA_RESTRICT src0 = src0_ptr;
+     const float   * GGML_CUDA_RESTRICT src1 = src1_ptr;
+     const float   * GGML_CUDA_RESTRICT src2 = src2_ptr;
+@@ -220,7 +221,7 @@
+         // parallel accumulation for output
+         state_sum = warp_reduce_sum(state_sum);
+ 
+-        if (lane == 0) {
++        if (lane == 0 && mode != 2) {
+             y_warp[i * stride_y] = state_sum;
+         }
+ 
+@@ -235,6 +236,7 @@
+         }
+     }
+ 
++    if (mode == 1) { return; }
+     // write back the state
+ #pragma unroll
+     for (int j = 0; j < c_factor; j++) {
+@@ -248,7 +250,7 @@
+                               const int src2_nb2, const int src3_nb1, const int src4_nb2, const int src4_nb3, const int src5_nb2,
+                               const int src5_nb3, const int64_t s_off, const int64_t d_state, const int64_t head_dim,
+                               const int64_t n_head, const int64_t n_group, const int64_t n_tok, const int64_t n_seq,
+-                              const int64_t K, const ggml_cuda_ssm_scan_fused_cache * cache, cudaStream_t stream) {
++                              const int64_t K, const int mode, const ggml_cuda_ssm_scan_fused_cache * cache, cudaStream_t stream) {
+     // when fused, the states go straight into the recurrent cache and the dst tail is left alone
+     char * const  s_base       = cache ? (char *) cache->data : (char *) dst + s_off;
+     const int64_t s_slot_bytes = cache ? cache->slot_stride * (int64_t) sizeof(float) : n_seq * (int64_t) src0_nb3;
+@@ -265,7 +267,7 @@
+             ggml_cuda_kernel_launch(ssm_scan_f32_group<96/WARP_SIZE, 96>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K);
++                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K, mode);
+         } else if (d_state == 128) {
+             constexpr int threads   = 128;
+             constexpr int num_warps = threads/WARP_SIZE;
+@@ -275,7 +277,7 @@
+             ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K);
++                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K, mode);
+         } else if (d_state == 256) { // Falcon-H1
+             constexpr int threads   = 256;
+             constexpr int num_warps = threads/WARP_SIZE;
+@@ -285,7 +287,7 @@
+             ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K);
++                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K, mode);
+         } else {
+             GGML_ABORT("doesn't support d_state!=(96, 128 or 256).");
+         }
+@@ -305,55 +307,55 @@
+                 ggml_cuda_kernel_launch(ssm_scan_f32<threads, 16, 1>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                 src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2,
+-                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok);
++                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok, mode);
+                 break;
+             case 2:
+                 ggml_cuda_kernel_launch(ssm_scan_f32<threads, 16, 2>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                 src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2,
+-                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok);
++                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok, mode);
+                 break;
+             case 3:
+                 ggml_cuda_kernel_launch(ssm_scan_f32<threads, 16, 3>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                 src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2,
+-                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok);
++                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok, mode);
+                 break;
+             case 4:
+                 ggml_cuda_kernel_launch(ssm_scan_f32<threads, 16, 4>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                 src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2,
+-                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok);
++                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok, mode);
+                 break;
+             case 5:
+                 ggml_cuda_kernel_launch(ssm_scan_f32<threads, 16, 5>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                 src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2,
+-                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok);
++                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok, mode);
+                 break;
+             case 6:
+                 ggml_cuda_kernel_launch(ssm_scan_f32<threads, 16, 6>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                 src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2,
+-                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok);
++                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok, mode);
+                 break;
+             case 7:
+                 ggml_cuda_kernel_launch(ssm_scan_f32<threads, 16, 7>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                 src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2,
+-                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok);
++                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok, mode);
+                 break;
+             case 8:
+                 ggml_cuda_kernel_launch(ssm_scan_f32<threads, 16, 8>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                 src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2,
+-                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok);
++                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok, mode);
+                 break;
+             default:
+                 ggml_cuda_kernel_launch(ssm_scan_f32<threads, 16, 0>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                 src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2,
+-                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok);
++                src3_nb1, src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_tok, mode);
+                 break;
+             }
+         } else {
+@@ -803,10 +805,18 @@
+     const int64_t n_s = src1->ne[3];  // number of sequences in the batch
+     const int32_t K_param = ggml_get_op_params_i32(dst, 0);
+     const int64_t K = K_param > 0 ? K_param : 1;
++    const int32_t mode = ggml_get_op_params_i32(dst, 1);   // 0=packed, 1=y only, 2=state only
+ 
+-    const int64_t s_off = ggml_nelements(src1) * sizeof(float);
++    // mode 2 时 dst 就是 state 张量本身，state 偏移为 0
++    const int64_t s_off = (mode == 2) ? 0 : ggml_nelements(src1) * sizeof(float);
+ 
+-    GGML_ASSERT(ggml_nelements(src1) + K*nc*nr*nh*n_s == ggml_nelements(dst));
++    if (mode == 0) {
++        GGML_ASSERT(ggml_nelements(src1) + K*nc*nr*nh*n_s == ggml_nelements(dst));
++    } else if (mode == 1) {
++        GGML_ASSERT(ggml_nelements(src1) == ggml_nelements(dst));
++    } else {
++        GGML_ASSERT(K*nc*nr*nh*n_s == ggml_nelements(dst));
++    }
+     GGML_ASSERT(src0->nb[0] == sizeof(float));
+     GGML_ASSERT(src1->nb[0] == sizeof(float));
+     GGML_ASSERT(src2->nb[0] == sizeof(float));
+@@ -849,7 +859,7 @@
+     const bool is_mamba2 = (src3->nb[1] == sizeof(float));
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const bool use_ssd = is_mamba2 && n_t > SSM_SSD_MIN_TOKENS
+-                      && K == 1
++                      && K == 1 && mode == 0
+                       && n_t <= SSM_SSD_MAX_TOKENS
+                       && GGML_CUDA_CC_IS_NVIDIA(cc)
+                       && cc >= GGML_CUDA_CC_TURING
+@@ -877,7 +887,7 @@
+     ssm_scan_f32_cuda(src0_d, src1_d, src2_d, src3_d, src4_d, src5_d, src6_d, dst_d,
+                       src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
+                       src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],
+-                      s_off, nc, nr, nh, ng, n_t, n_s, K, cache, stream);
++                      s_off, nc, nr, nh, ng, n_t, n_s, K, mode, cache, stream);
+ }
+ 
+ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -1204,6 +1204,14 @@
+ }
+ 
+ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
++    // 2026-10-18: 实验开关。默认保持官方门禁不变；只有显式设置环境变量时才放行
++    // 尚未官方支持张量并行的架构（当前用于 nemotron_h_moe 的移植验证）。
++    {
++        const char * allow = getenv("LLAMA_SM_TENSOR_ALLOW_ARCH");
++        if (allow != nullptr && allow[0] != '\0' && allow[0] != '0') {
++            return true;
++        }
++    }
+     switch (arch) {
+         case LLM_ARCH_GROK:
+         case LLM_ARCH_MPT:
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -386,6 +386,10 @@
+     const std::string tensor_name = tensor->name;
+     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
+         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
++    // 2026-10-18: nemotron_h* 用 build_mamba2_layer，SSM 层的通道划分必须按「组」对齐
++    // （d_inner = n_group * ch_group），否则 scan/conv/rms-norm 会跨卡。
++    const bool is_nemotron_mamba2 = ud->model->arch == LLM_ARCH_NEMOTRON_H ||
++                                    ud->model->arch == LLM_ARCH_NEMOTRON_H_MOE;
+ 
+     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
+     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
+@@ -415,7 +419,12 @@
+     static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
+     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
+     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
++    static const std::regex pattern_ssm_conv1d_bias ("blk\\.\\d*\\.ssm_conv1d.bias");
+     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
++    // 2026-10-18: 融合投影 [z | x | B | C | dt] 与逐头/逐组张量，nemotron_h* 张量并行需要
++    static const std::regex pattern_ssm_in          ("blk\\.\\d*\\.ssm_in.weight");
++    static const std::regex pattern_ssm_d           ("blk\\.\\d*\\.ssm_d");
++    static const std::regex pattern_ssm_norm        ("blk\\.\\d*\\.ssm_norm.weight");
+ 
+     static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?.weight");
+     static const std::regex pattern_ffn_up_bias       ("blk\\.\\d*\\.ffn_up(_exps)?.bias");
+@@ -429,6 +438,7 @@
+     static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
+     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
+ 
++    static const std::regex pattern_token_embd   ("token_embd\\.weight");
+     static const std::regex pattern_output_weight("output\\.weight");
+     static const std::regex pattern_output_bias  ("output\\.bias");
+ 
+@@ -558,7 +568,28 @@
+             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+         }
+         if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a)) {
+-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
++            if (is_nemotron_mamba2) {
++                // 2026-10-18: dt.bias 有 n_ssm_head 个元素（头在 axis0）；ssm_a 形状 [1, n_ssm_head]（头在 axis1）。
++                // 二者都参与 scan，必须与 head 轴同分布，否则每卡会拿到错误的头参数。
++                return std::regex_match(tensor_name, pattern_ssm_dt)
++                    ? get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_dt.bias")
++                    : get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_a");
++            }
++            // 2026-10-18: ssm_dt.bias / ssm_a 只有 n_ssm_head 个元素，且其对称视图在 meta 后端被判为 MIRRORED；
++            // 若强行切分会得到 ADD(MIRRORED, split) → 切分推断失败。镜像代价可忽略。
++            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++        }
++        if (is_nemotron_mamba2 && std::regex_match(tensor_name, pattern_ssm_d)) {
++            // y = add(y, x * D)：D 每个头一个值，沿 axis1（头轴）切
++            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_d");
++        }
++        if (is_nemotron_mamba2 && std::regex_match(tensor_name, pattern_ssm_norm)) {
++            // 分组 RMS norm：[ch_group, n_group]，组在 axis1
++            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_norm.weight");
++        }
++        if (is_nemotron_mamba2 && std::regex_match(tensor_name, pattern_ssm_in)) {
++            // 融合投影 [z | x | B | C | dt]，沿输出特征轴（axis1）按段切
++            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+         }
+         if (std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta) ||
+                 std::regex_match(tensor_name, pattern_ssm_beta_alpha)) {
+@@ -574,6 +605,10 @@
+         if (std::regex_match(tensor_name, pattern_ssm_conv1d)) {
+             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+         }
++        if (std::regex_match(tensor_name, pattern_ssm_conv1d_bias)) {
++            // 2026-10-18: 卷积偏置与卷积权重的列（axis1）一一对应，必须按同一粒度切成 axis0 切片
++            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_conv1d.weight");
++        }
+         if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+         }
+@@ -599,6 +634,10 @@
+         }
+ 
+         // output
++        if (std::regex_match(tensor_name, pattern_token_embd)) {
++            // 2026-10-18: 词表维可按 axis1 切分，避免每张卡各存一份完整 embedding
++            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
++        }
+         if (std::regex_match(tensor_name, pattern_output_weight)) {
+             if (is_dsv4) {
+                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+@@ -617,6 +656,32 @@
+ 
+     // if a model has fused tensors they need to be separated into "segments", see the comments on ggml_backend_meta_split_state struct
+     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
++        // 2026-10-18: nemotron_h* 的 Mamba2 层。SSM 参数按「组」对齐切分：
++        //   d_inner = 8 组 × 1024 通道，B/C 每组的 d_state=128 通道，dt 每组 16 头。
++        // 这样 scan / conv1d / 分组 RMS norm 全部留在单卡内，只需在 ssm_out 后做一次 allreduce。
++        if (is_nemotron_mamba2 && axis >= 0 && hparams.is_recr(il)) {
++            const int64_t d_inner = hparams.ssm_d_inner;
++            const int64_t d_state = hparams.ssm_d_state;
++            const int64_t n_group = hparams.ssm_n_group;
++            const int64_t n_head  = hparams.ssm_dt_rank;
++            const int64_t d_conv  = hparams.ssm_d_conv;
++            if (std::regex_match(tensor_name, pattern_ssm_in)) {
++                // 布局：z(d_inner) | x(d_inner) | B(n_group*d_state) | C(n_group*d_state) | dt(n_head)
++                GGML_ASSERT(tensor->ne[axis] == 2*d_inner + 2*n_group*d_state + n_head);
++                return {{d_inner, 1}, {d_inner, 1}, {n_group*d_state, 1}, {n_group*d_state, 1}, {n_head, 1}};
++            }
++            if (std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_conv1d_bias)) {
++                // [d_conv, d_inner + 2*n_group*d_state]，通道轴 = x | B | C
++                GGML_ASSERT(tensor->ne[axis] == d_inner + 2*n_group*d_state);
++                return {{d_inner, 1}, {n_group*d_state, 1}, {n_group*d_state, 1}};
++            }
++            if (std::regex_match(tensor_name, pattern_r_cache)) {
++                // 每个槽位：(d_conv-1) × (d_inner + 2*n_group*d_state)，同样三段
++                GGML_ASSERT(tensor->ne[axis] == (d_conv - 1) * (d_inner + 2*n_group*d_state));
++                return {{(d_conv - 1)*d_inner, 1}, {(d_conv - 1)*n_group*d_state, 1}, {(d_conv - 1)*n_group*d_state, 1}};
++            }
++            return {{tensor->ne[axis], 1}};
++        }
+         // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
+         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_CLEF ||
+                 ud->model->arch == LLM_ARCH_QWEN4EXP) {
+@@ -709,12 +774,49 @@
+     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
+         if (hparams.is_recr(il)) {
++            // 2026-10-18: nemotron_h* 的 Mamba2 层。粒度必须与「组」对齐，且各段可以不同：
++            //   x/z/y 通道 = ch_group(1024)，B/C 每组 = d_state(128)，dt 每组 = heads_per_group(16)。
++            if (is_nemotron_mamba2) {
++                const int64_t d_inner  = hparams.ssm_d_inner;
++                const int64_t d_state  = hparams.ssm_d_state;
++                const int64_t n_group  = hparams.ssm_n_group;
++                const int64_t n_head   = hparams.ssm_dt_rank;
++                const int64_t d_conv   = hparams.ssm_d_conv;
++                const int64_t ch_group = d_inner / n_group;          // 1024
++                const int64_t hpg      = n_head / n_group;           // 16 头/组
++                const int64_t head_dim = d_inner / n_head;           // 64
++                if (std::regex_match(tensor_name, pattern_ssm_in)) {
++                    return {ch_group, ch_group, d_state, d_state, hpg};
++                }
++                if (std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_conv1d_bias)) {
++                    return {ch_group, d_state, d_state};
++                }
++                if (std::regex_match(tensor_name, pattern_r_cache)) {
++                    return {(d_conv - 1)*ch_group, (d_conv - 1)*d_state, (d_conv - 1)*d_state};
++                }
++                if (std::regex_match(tensor_name, pattern_s_cache)) {
++                    // 必须按「组」对齐（16 个头的状态），否则 3 卡会切成 42/43/43 个头，
++                    // 与 x/dt/A/B/C 的 2/3/3 组分布对不上。
++                    return {d_state * head_dim * hpg};
++                }
++                if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
++                    return {ch_group};
++                }
++                if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
++                        std::regex_match(tensor_name, pattern_ssm_d)) {
++                    return {hpg};
++                }
++                if (std::regex_match(tensor_name, pattern_ssm_norm)) {
++                    return {1};
++                }
++            }
+             // linear attention
+             const int64_t head_dim        = hparams.ssm_d_state;
+             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
+             const int64_t granularity_qkv = std::lcm(blck_size_perf, head_dim);
+             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+-                    std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
++                    std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_conv1d_bias) ||
++                    std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                 return std::vector<int64_t>(segments.size(), granularity_qkv);
+             }
+             if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
+@@ -734,6 +836,24 @@
+             // regular attention
+             const uint32_t n_gqa    = hparams.n_gqa(il);
+             const uint32_t n_embd_q = n_gqa * hparams.n_embd_head_k(il);
++            // 2026-10-18 实验：混合架构（如 nemotron_h_moe）里有些 MoE 层没有 KV 头，
++            // n_embd_q 会变成 0，后续 lcm(0,…)/n_gqa 触发 SIGFPE。
++            // 注意：只有「注意力张量」需要按头切分；FFN/专家张量必须继续走下面的块对齐规则，
++            // 否则会出现 682 行这种 256 块不对齐的切分。
++            if (n_gqa == 0 || hparams.n_embd_head_k(il) == 0) {
++                const bool is_ffn_tensor =
++                    std::regex_match(tensor_name, pattern_ffn_up_weight)   || std::regex_match(tensor_name, pattern_ffn_up_bias) ||
++                    std::regex_match(tensor_name, pattern_ffn_gate_weight) || std::regex_match(tensor_name, pattern_ffn_gate_bias) ||
++                    std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
++                    std::regex_match(tensor_name, pattern_ffn_down_weight) ||
++                    std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
++                    std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
++                    std::regex_match(tensor_name, pattern_ffn_down_shexp_weight);
++                if (is_ffn_tensor) {
++                    return std::vector<int64_t>(segments.size(), std::lcm(ggml_blck_size(tensor->type), 128));
++                }
++                return std::vector<int64_t>(segments.size(), 1);
++            }
+ 
+             // to handle head sizes like 80, only increase granularity while it doesn't cause underutilization
+             int64_t blck_size_perf = blck_size;
+@@ -828,7 +948,9 @@
+                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
++            // 2026-10-18: 必须用**该张量自身**的块大小，meta 侧断言用的是 ggml_blck_size(tensor->type)。
++            // 用参考张量的 blck_size 会在混合量化文件（专家 IQ2_XXS / 其余 Q8_0 等）里错位。
++            const int64_t blck_size_perf = std::lcm(ggml_blck_size(tensor->type), 128);
+             GGML_ASSERT(segments.size() == 1);
+             return {blck_size_perf};
+         }
+@@ -855,6 +977,15 @@
+         }
+         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
+         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
++        if (tensor_name.rfind("blk.1.ffn_down_exps", 0) == 0 || tensor_name.rfind("blk.0.ssm_in", 0) == 0 || tensor_name.rfind("token_embd", 0) == 0) {
++            fprintf(stderr, "[SPLIT-GRAN] %-32s axis=%d blck(ref)=%lld blck(self)=%lld g=[%lld] nseg=%zu is_recr=%d m_up=%d m_down=%d m_gate=%d\n",
++                    tensor_name.c_str(), (int) split_state.axis, (long long) blck_size,
++                    (long long) ggml_blck_size(tensor->type), (long long) granularity[0], segments.size(),
++                    (int) hparams.is_recr(tc.il),
++                    (int) std::regex_match(tensor_name, pattern_ffn_up_weight),
++                    (int) std::regex_match(tensor_name, pattern_ffn_down_weight),
++                    (int) std::regex_match(tensor_name, pattern_ffn_gate_weight));
++        }
+         for (size_t is = 0; is < segments.size(); is++) {
+             const int64_t  ne_s = segments[is].first;
+             const uint32_t nr_s = segments[is].second;
+@@ -874,6 +1005,20 @@
+             split_state.nr[is] = nr_s;
+         }
+         split_state.n_segments = segments.size();
++        // 2026-10-18: 若某张量按当前粒度切分后有任何一卡分到 0 行（典型如 blk.N.ssm_a 的 ne[0]=1），
++        // 分片缓冲区会得到 nbytes=0 的张量，加载器写入时越界。此类张量退化为「每卡一份完整副本」。
++        {
++            bool any_zero = false;
++            for (size_t i = 0; i < segments.size()*ud->n_devices; i++) {
++                if (split_state.ne[i] == 0) { any_zero = true; break; }
++            }
++            if (any_zero) {
++                memset(split_state.ne, 0, sizeof(split_state.ne));
++                split_state.nr[0] = 1;
++                split_state.n_segments = 1;
++                split_state.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
++            }
++        }
+     } else {
+         memset(split_state.ne, 0, sizeof(split_state.ne));
+         split_state.nr[0] = 1;
+@@ -889,6 +1034,10 @@
+             }
+         }
+     }
++    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && ggml_nbytes(tensor) > 50ull*1024*1024) {
++        fprintf(stderr, "[MIRROR-DIAG] %-40s %8.1f MiB\n", tensor->name, ggml_nbytes(tensor)/1048576.0);
++        fflush(stderr);
++    }
+     return split_state;
+     GGML_UNUSED(userdata);
+ }
+--- a/src/models/mamba-base.cpp
++++ b/src/models/mamba-base.cpp
+@@ -116,22 +116,27 @@
+         // use the states and the indices provided by build_recurrent_state
+         // (this is necessary in order to properly use the states before they are overwritten,
+         //  while avoiding to make unnecessary copies of the states)
+-        auto get_ssm_rows = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
++        // 2026-10-18: scan 拆成两个自然形状的输出（y 与 state），以便张量并行按 head 轴切分。
++        // 代价是 scan 计算跑两遍（解码阶段开销很小）。
++        auto get_ssm_rows_y = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
+             ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, mctx_cur->get_size());
+-
+-            // Custom operator to optimize the parallel associative scan
+-            // as described in the Annex D of the Mamba paper.
+-            // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}
+-            return ggml_ssm_scan(ctx, ssm, x, dt, A, B, C, ids, /*K=*/1);
++            return ggml_ssm_scan_y(ctx, ssm, x, dt, A, B, C, ids, /*K=*/1);
++        };
++        auto get_ssm_rows_state = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
++            ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, mctx_cur->get_size());
++            return ggml_ssm_scan_state(ctx, ssm, x, dt, A, B, C, ids, /*K=*/1);
+         };
+ 
+-        ggml_tensor * y_ssm = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows);
++        ggml_tensor * y_ssm = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows_y);
+ 
+         // store last states
+-        ggml_build_forward_expand(
+-            gf, ggml_cpy(ctx0, ggml_view_1d(ctx0, y_ssm, d_state * d_inner * n_seqs, x->nb[3] * x->ne[3]),
+-                         ggml_view_1d(ctx0, ssm_states_all, d_state * d_inner * n_seqs,
+-                                      kv_head * d_state * d_inner * ggml_element_size(ssm_states_all))));
++        {
++            ggml_tensor * state_new = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows_state);
++            ggml_build_forward_expand(
++                gf, ggml_cpy(ctx0, state_new,
++                             ggml_view_1d(ctx0, ssm_states_all, d_state * d_inner * n_seqs,
++                                          kv_head * d_state * d_inner * ggml_element_size(ssm_states_all))));
++        }
+ 
+         ggml_tensor * y = ggml_view_3d(ctx0, y_ssm, d_inner, n_seq_tokens, n_seqs, x->nb[2], x->nb[3], 0);
+ 
+@@ -255,31 +260,35 @@
+         // use the states and the indices provided by build_recurrent_state
+         // (this is necessary in order to properly use the states before they are overwritten,
+         //  while avoiding to make unnecessary copies of the states)
+-        auto get_ssm_rows = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
++        // 2026-10-18: scan 拆成 y / state 两个输出，便于张量并行按 head 轴切分：
++        //   y     形状同 x   [head_dim, n_head, n_tok, n_seqs]
++        //   state 形状同 s   [d_state, head_dim, n_head, n_seqs]
++        // 代价是 scan 算两遍（解码阶段可忽略）。
++        auto get_ssm_rows_y = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
+             ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, state_slots);
+-
+-            // TODO: use semistructured matrices to implement state-space duality
+-            // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}
+-            // K > 1 asks the backend to return rollback snapshots in addition to the final state.
+-            return ggml_ssm_scan(ctx, ssm, x, dt, A, B, C, ids, K);
++            return ggml_ssm_scan_y(ctx, ssm, x, dt, A, B, C, ids, K);
++        };
++        auto get_ssm_rows_state = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
++            GGML_ASSERT(K == 1 && "tensor-parallel ssm scan does not support rollback snapshots yet");
++            ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, state_slots);
++            return ggml_ssm_scan_state(ctx, ssm, x, dt, A, B, C, ids, 1);
+         };
+ 
+-        ggml_tensor * y_ssm = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows);
+-        const int64_t D            = d_state * d_inner;
+-        const int64_t n_written    = std::min<int64_t>(n_seq_tokens, K);
+-        const size_t  row_size     = ggml_row_size(ssm_states_all->type, D);
+-        const size_t  y_row_size   = ggml_row_size(y_ssm->type, D);
+-        const size_t  state_offset = ggml_nelements(x) * ggml_element_size(x);
+-
+-        ggml_build_forward_expand(
+-            gf, ggml_cpy(ctx0,
+-                         ggml_view_3d(ctx0, y_ssm, D, n_seqs, n_written,
+-                                      y_row_size, y_row_size * n_seqs, state_offset),
+-                         ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, n_written,
+-                                      ssm_states_all->nb[1], (size_t) mem_size * row_size, kv_head * row_size)));
++        ggml_tensor * y_ssm = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows_y);
++        const int64_t D        = d_state * d_inner;
++        const size_t  row_size = ggml_row_size(ssm_states_all->type, D);
++
++        {
++            ggml_tensor * state_new = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows_state);
++            ggml_tensor * state_flat = ggml_reshape_2d(ctx0, state_new, D, n_seqs);
++            ggml_build_forward_expand(
++                gf, ggml_cpy(ctx0, state_flat,
++                             ggml_view_2d(ctx0, ssm_states_all, D, n_seqs,
++                                          ssm_states_all->nb[1], kv_head * row_size)));
++        }
+ 
+-        ggml_tensor * y = ggml_view_4d(ctx0, y_ssm, head_dim, n_head, n_seq_tokens, n_seqs, x->nb[1], n_head * x->nb[1],
+-                                       n_seq_tokens * n_head * x->nb[1], 0);
++        // mode 1 的输出已经就是 x 的形状
++        ggml_tensor * y = y_ssm;
+ 
+         // TODO: skip computing output earlier for unused tokens
+ 

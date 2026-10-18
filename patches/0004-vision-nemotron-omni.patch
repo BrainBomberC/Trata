@@ -1,0 +1,311 @@
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -1042,6 +1042,10 @@
+             {
+                 builder = std::make_unique<clip_graph_nemotron_v2_vl>(ctx, img);
+             } break;
++        case PROJECTOR_TYPE_NEMOTRON_OMNI:
++            {
++                builder = std::make_unique<clip_graph_nemotron_omni>(ctx, img);
++            } break;
+         case PROJECTOR_TYPE_LLAMA4:
+             {
+                 builder = std::make_unique<clip_graph_llama4>(ctx, img);
+@@ -1523,6 +1527,16 @@
+                     {
+                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+                     } break;
++                case PROJECTOR_TYPE_NEMOTRON_OMNI:
++                    {
++                        hparams.ffn_op = FFN_GELU_ERF;
++                        log_ffn_op = "gelu_erf";
++                        hparams.image_resize_pad = PAD_NONE;
++                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge);
++                        get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
++                        get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
++                        hparams.warmup_image_size = hparams.image_size;
++                    } break;
+                 case PROJECTOR_TYPE_PARAKEET:
+                     {
+                         get_u32(KEY_AUDIO_SUBSMPL_FACTOR, hparams.subsampling_factor);
+@@ -3269,6 +3283,7 @@
+                     model.mm_3_b = get_tensor(string_format(TN_MVLM_PROJ_MLP, 3, "bias"));
+                 } break;
+             case PROJECTOR_TYPE_NEMOTRON_V2_VL:
++            case PROJECTOR_TYPE_NEMOTRON_OMNI:
+                 {
+                     model.mm_0_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 0, "weight"));
+                     model.mm_1_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 1, "weight"));
+@@ -4320,6 +4335,7 @@
+         case PROJECTOR_TYPE_COHERE2V:
+         case PROJECTOR_TYPE_INTERNVL:
+         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
++        case PROJECTOR_TYPE_NEMOTRON_OMNI:
+         case PROJECTOR_TYPE_LLAMA4:
+             {
+                 // both X and Y are downscaled by the scale factor
+@@ -5428,6 +5444,7 @@
+         case PROJECTOR_TYPE_COHERE2V:
+         case PROJECTOR_TYPE_INTERNVL:
+         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
++        case PROJECTOR_TYPE_NEMOTRON_OMNI:
+         case PROJECTOR_TYPE_QWEN2A:
+         case PROJECTOR_TYPE_QWEN3A:
+         case PROJECTOR_TYPE_GLMA:
+@@ -6149,6 +6166,7 @@
+             return ctx->model.mm_3_w->ne[1]; // out_proj output dim
+         case PROJECTOR_TYPE_INTERNVL:
+         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
++        case PROJECTOR_TYPE_NEMOTRON_OMNI:
+             return ctx->model.mm_3_w->ne[1];
+         case PROJECTOR_TYPE_LLAMA4:
+             return ctx->model.mm_model_proj->ne[1];
+@@ -6225,6 +6243,7 @@
+         case PROJECTOR_TYPE_QWEN2VL:
+         case PROJECTOR_TYPE_QWEN25VL:
+         case PROJECTOR_TYPE_QWEN3VL:
++        case PROJECTOR_TYPE_NEMOTRON_OMNI:
+         case PROJECTOR_TYPE_LING3VL:
+             return 2;
+         default:
+--- a/tools/mtmd/clip-impl.h
++++ b/tools/mtmd/clip-impl.h
+@@ -498,6 +498,7 @@
+     PROJECTOR_TYPE_YASA2,
+     PROJECTOR_TYPE_KIMIK25,
+     PROJECTOR_TYPE_NEMOTRON_V2_VL,
++    PROJECTOR_TYPE_NEMOTRON_OMNI,
+     PROJECTOR_TYPE_HUNYUANVL,
+     PROJECTOR_TYPE_PARAKEET,
+     PROJECTOR_TYPE_EXAONE4_5,
+@@ -569,6 +570,7 @@
+     { PROJECTOR_TYPE_YASA2,             "yasa2"},
+     { PROJECTOR_TYPE_KIMIK25,           "kimik25"},
+     { PROJECTOR_TYPE_NEMOTRON_V2_VL,    "nemotron_v2_vl"},
++    { PROJECTOR_TYPE_NEMOTRON_OMNI,     "nemotron_omni"},
+     { PROJECTOR_TYPE_EXAONE4_5,         "exaone4_5"},
+     { PROJECTOR_TYPE_HUNYUANVL,         "hunyuanvl"},
+     { PROJECTOR_TYPE_MINICPMV4_6,       "minicpmv4_6"},
+--- a/tools/mtmd/clip-model.h
++++ b/tools/mtmd/clip-model.h
+@@ -566,7 +566,7 @@
+     // embeddings
+     ggml_tensor * class_embedding = nullptr;
+     ggml_tensor * patch_embeddings_0 = nullptr;
+-    ggml_tensor * patch_embeddings_1 = nullptr;  // second Conv2D kernel when we decouple Conv3D along temporal dimension (Qwen2VL)
++    ggml_tensor * patch_embeddings_1 = nullptr;  // additional patch kernel; interpretation is model-specific (Qwen2VL, Nemotron Omni)
+     ggml_tensor * patch_bias = nullptr;
+     ggml_tensor * position_embeddings = nullptr;
+     ggml_tensor * norm_embd_w = nullptr;
+--- a/tools/mtmd/CMakeLists.txt
++++ b/tools/mtmd/CMakeLists.txt
+@@ -46,6 +46,7 @@
+             models/kimivl.cpp
+             models/kimik25.cpp
+             models/nemotron-v2-vl.cpp
++            models/nemotron-omni.cpp
+             models/muse-glimmer.cpp
+             models/llama4.cpp
+             models/llava.cpp
+--- a/tools/mtmd/models/models.h
++++ b/tools/mtmd/models/models.h
+@@ -109,6 +109,12 @@
+     ggml_cgraph * build() override;
+ };
+ 
++struct clip_graph_nemotron_omni : clip_graph {
++    clip_graph_nemotron_omni(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
++    ggml_cgraph * build() override;
++    ggml_tensor * build_inp_with_temporal_merge();
++};
++
+ struct clip_graph_llama4 : clip_graph {
+     clip_graph_llama4(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+     ggml_cgraph * build() override;
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -563,6 +563,7 @@
+ 
+     std::unique_ptr<mtmd_audio_preprocessor> audio_preproc;
+     std::unique_ptr<mtmd_image_preprocessor> image_preproc;
++    std::unique_ptr<mtmd_image_preprocessor> video_preproc;
+ 
+     // batching
+     int32_t batch_max_tokens;
+@@ -669,6 +670,7 @@
+     void init_vision() {
+         GGML_ASSERT(ctx_v != nullptr);
+         image_preproc.reset();
++        video_preproc.reset();
+ 
+         projector_type proj = clip_get_projector_type(ctx_v);
+ 
+@@ -898,6 +900,13 @@
+                 {
+                     image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
+                 } break;
++            case PROJECTOR_TYPE_NEMOTRON_OMNI:
++                {
++                    img_beg = "<img>";
++                    img_end = "</img>";
++                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
++                    video_preproc = std::make_unique<mtmd_image_preprocessor_nemotron_omni_video>(ctx_v);
++                } break;
+             case PROJECTOR_TYPE_LFM2:
+                 {
+                     // multi-tile:
+@@ -1331,6 +1340,11 @@
+                     return 1;
+                 }
+                 auto bmps = merged_bitmaps[i_bm++];
++                // For nemotron-omni, we duplicate the frame if only one is available
++                if (ctx->proj_type_v() == PROJECTOR_TYPE_NEMOTRON_OMNI && n_merge_frames == 2
++                        && bmps.size() == 1 && bmps[0]->mergeable && !bmps[0]->is_audio) {
++                    bmps.push_back(bmps[0]);
++                }
+                 int32_t res = add_media(bmps);
+                 if (res != 0) {
+                     return res;
+@@ -1445,8 +1459,12 @@
+                     bmp->is_placeholder());
+                 img_u8.cpy_buf(bmp->get_ro_buf());
+ 
+-                // preprocess image
+-                mtmd_image_preproc_out tmp_preproc_out = ctx->image_preproc->preprocess(img_u8);
++                // preprocess image or video
++                const mtmd_image_preprocessor * preprocessor = ctx->image_preproc.get();
++                if (bmp->mergeable && ctx->video_preproc) {
++                    preprocessor = ctx->video_preproc.get();
++                }
++                mtmd_image_preproc_out tmp_preproc_out = preprocessor->preprocess(img_u8);
+ 
+                 // move entries and grid dimensions to the "global" preproc_out
+                 for (auto & entry : tmp_preproc_out.entries) {
+--- a/tools/mtmd/mtmd-image.cpp
++++ b/tools/mtmd/mtmd-image.cpp
+@@ -1872,3 +1872,50 @@
+     output.append(hparams, resized_image, true);
+     return output;
+ }
++
++//
++// mtmd_image_preprocessor_nemotron_omni_video
++//
++
++clip_image_size mtmd_image_preprocessor_nemotron_omni_video::target_video_size(
++        const clip_hparams & hparams,
++        const clip_image_size & original_size) {
++    GGML_ASSERT(original_size.width > 0 && original_size.height > 0);
++    GGML_ASSERT(hparams.patch_size > 0 && hparams.n_merge > 0);
++
++    const int patch_area = hparams.patch_size * hparams.patch_size;
++    GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_min_pixels % patch_area == 0);
++    const int target = hparams.image_min_pixels / patch_area;
++    const double aspect = static_cast<double>(original_size.width) / original_size.height;
++    auto py_round = [](double value) { return static_cast<int>(std::nearbyint(value)); };
++
++    int target_h = std::max(py_round(std::sqrt(target / aspect)), 1);
++    int target_w = std::max(py_round(std::sqrt(target * aspect)), 1);
++    const int divisor = hparams.n_merge;
++    if (divisor > 1) {
++        const int rem_h = target_h % divisor;
++        const int rem_w = target_w % divisor;
++        const int h_up = target_h + (rem_h ? divisor - rem_h : 0);
++        const int w_up = target_w + (rem_w ? divisor - rem_w : 0);
++        if (h_up * w_up <= target) {
++            target_h = h_up;
++            target_w = w_up;
++        } else {
++            target_h = std::max(divisor, target_h - rem_h);
++            target_w = std::max(divisor, target_w - rem_w);
++        }
++    }
++
++    return {target_w * hparams.patch_size, target_h * hparams.patch_size};
++}
++
++mtmd_image_preproc_out mtmd_image_preprocessor_nemotron_omni_video::preprocess(const clip_image_u8 & img) const {
++    const clip_image_size target_size = target_video_size(hparams, img.get_size());
++
++    clip_image_u8 resized_image;
++    img_tool::resize(img, resized_image, target_size, hparams.image_resize_algo, PAD_NONE);
++
++    mtmd_image_preproc_out output;
++    output.append(hparams, resized_image, true);
++    return output;
++}
+--- a/tools/mtmd/mtmd-image.h
++++ b/tools/mtmd/mtmd-image.h
+@@ -300,3 +300,11 @@
+     mtmd_image_preprocessor_muse_glimmer(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+ };
++
++struct mtmd_image_preprocessor_nemotron_omni_video : mtmd_image_preprocessor {
++    mtmd_image_preprocessor_nemotron_omni_video(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
++
++    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
++
++    static clip_image_size target_video_size(const clip_hparams & hparams, const clip_image_size & original_size);
++};
+--- /dev/null
++++ b/tools/mtmd/models/nemotron-omni.cpp
+@@ -0,0 +1,58 @@
++#include "models.h"
++
++ggml_tensor * clip_graph_nemotron_omni::build_inp_with_temporal_merge() {
++    // 2026-10-18: 这个模型的 patch embedding 是 6 通道（2 帧做时间合并）。
++    // 单张图片（n_batch==1）必须先把这一帧复制一份，否则会走经典 3 通道 build_inp()，
++    // 得到的 embedding 完全对不上 —— 实测会「看见」纯色却答错颜色。
++    GGML_ASSERT(model.patch_embeddings_1 != nullptr);
++
++    ggml_tensor * inp_raw = build_inp_raw();
++
++    if (n_batch == 1) {
++        inp_raw = ggml_reshape_4d(ctx0, inp_raw, img.nx(), img.ny(), 3, 1);
++        inp_raw = ggml_concat(ctx0, inp_raw, inp_raw, 2);      // 复制最后一帧 → 6 通道
++        inp_raw = ggml_reshape_4d(ctx0, inp_raw, img.nx(), img.ny(), 6, 1);
++    } else {
++        GGML_ASSERT(n_batch == 2);
++        inp_raw = ggml_reshape_4d(ctx0, inp_raw, img.nx(), img.ny(), 3 * n_batch, 1);
++    }
++
++    GGML_ASSERT(model.patch_embeddings_1->ne[2] == 6);
++
++    ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
++    inp = ggml_reshape_3d(ctx0, inp, n_patches, n_embd, 1);
++    return ggml_cont(ctx0, ggml_transpose(ctx0, inp));
++}
++
++ggml_cgraph * clip_graph_nemotron_omni::build() {
++    GGML_ASSERT(model.class_embedding != nullptr);
++    GGML_ASSERT(model.position_embeddings != nullptr);
++
++    const int n_registers = model.class_embedding->ne[1];
++    const int n_pos = n_patches + n_registers;
++
++    ggml_tensor * inp = build_inp_with_temporal_merge();
++
++    inp = ggml_add(ctx0, inp, resize_position_embeddings(GGML_SCALE_MODE_BILINEAR));
++    cb(inp, "inp_pos", -1);
++
++    inp = ggml_concat(ctx0, model.class_embedding, inp, 1);
++
++    ggml_tensor * cur = build_vit(inp, n_pos, NORM_TYPE_NORMAL, hparams.ffn_op, nullptr, nullptr);
++
++    cur = ggml_view_2d(ctx0, cur,
++        n_embd, n_patches,
++        ggml_row_size(cur->type, n_embd),
++        n_registers * ggml_row_size(cur->type, n_embd));
++
++    cur = build_patch_merge_permute(cur, model.hparams.n_merge);
++
++    {
++        cur = build_norm(cur, model.mm_0_w, nullptr, NORM_TYPE_RMS, 1e-5, -1);
++        cur = build_ffn(cur, model.mm_1_w, nullptr, nullptr, nullptr, model.mm_3_w, nullptr, FFN_RELU_SQR, -1);
++    }
++
++    ggml_build_forward_expand(gf, cur);
++
++    return gf;
++}
