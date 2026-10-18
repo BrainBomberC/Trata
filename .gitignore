@@ -21,9 +21,10 @@ cmake-build-*/
 # 运行产物
 *.pid
 *.log
+logs/
+!benchmarks/logs/
 !benchmarks/logs/*.log
 !benchmarks/logs/*.txt
-logs/
 run/
 
 # Python

@@ -1,0 +1,38 @@
+[17:13:39] === Bolt 74B 运行 20261017-171339 | CTX=32768 | MODE=cmoe (cache 12000MiB) ===
+[17:13:39] VRAM: 0, 15 MiB, 11898 MiB|1, 15 MiB, 11898 MiB|2, 512 MiB, 11397 MiB|
+[17:13:39] 内存: 内存：          46Gi       4.2Gi       1.7Gi        17Mi        41Gi        42Gi  swap: 交换：         4.0Gi       4.0Gi       156Ki
+[17:15:39]   …加载 2 分钟 | Cached 42.4 GiB
+[17:17:39]   …加载 4 分钟 | Cached 42.3 GiB
+[17:18:09] ✅ 加载完成 270s（≈4.5 分钟）
+[17:18:12] --- 显存分解 ---
+    GPU 0, 8259 MiB, 3654 MiB
+    GPU 1, 6433 MiB, 5480 MiB
+    GPU 2, 7382 MiB, 4528 MiB
+    4.09.954.477 I load_tensors: offloaded 89/89 layers to GPU
+    4.09.954.713 I load_tensors:   CPU_Mapped model buffer size = 43837.39 MiB
+    4.09.954.715 I load_tensors:        CUDA0 model buffer size =  2063.55 MiB
+    4.09.954.716 I load_tensors:        CUDA1 model buffer size =  2050.48 MiB
+    4.09.954.717 I load_tensors:        CUDA2 model buffer size =  2499.46 MiB
+    4.13.285.851 I llama_kv_cache:      CUDA0 KV buffer size =    51.00 MiB
+    4.13.286.241 I llama_kv_cache:      CUDA1 KV buffer size =    51.00 MiB
+    4.13.286.620 I llama_kv_cache:      CUDA2 KV buffer size =    34.00 MiB
+    4.13.287.139 I llama_memory_recurrent:      CUDA0 RS buffer size =    57.64 MiB
+    4.13.287.450 I llama_memory_recurrent:      CUDA1 RS buffer size =    53.52 MiB
+    4.13.287.765 I llama_memory_recurrent:      CUDA2 RS buffer size =    53.52 MiB
+    4.13.391.728 I sched_reserve:      CUDA0 compute buffer size =  1946.69 MiB
+    4.13.391.734 I sched_reserve:      CUDA1 compute buffer size =   142.45 MiB
+    4.13.391.735 I sched_reserve:      CUDA2 compute buffer size =   158.48 MiB
+    4.13.391.736 I sched_reserve:  CUDA_Host compute buffer size =    64.09 MiB
+[17:18:12] — 预热 —
+  decode 0.66 tok/s | prefill 3.24 tok/s | 生成 8 tok | 提示 1 tok | 10.9s
+[17:18:23] — 短答 128 tok —
+  decode 1.40 tok/s | prefill 0.71 tok/s | 生成 121 tok | 提示 34 tok | 133.3s
+[17:20:37] — 中答 512 tok —
+  decode 5.17 tok/s | prefill 1.62 tok/s | 生成 512 tok | 提示 41 tok | 124.0s
+[17:22:41] — 200K 上下文预填充（真实要求）—
+[17:24:58] --- 最终 VRAM/内存 ---
+    GPU 0, 8329 MiB, 3584 MiB
+    GPU 1, 6497 MiB, 5416 MiB
+    GPU 2, 7452 MiB, 4457 MiB
+[17:24:58] 日志 /path/to/Nemotron3Super-120B/model/bolt-20261017-171339.log
+[17:24:58] 报告 /path/to/Nemotron3Super-120B/model/bolt-20261017-171339.report.txt

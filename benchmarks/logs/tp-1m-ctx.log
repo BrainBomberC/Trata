@@ -1,0 +1,210 @@
+0.00.055.183 I srv  llama_server: initializing ...
+0.00.055.212 I cmn  common_param: common_params_print_info: build 0 (unknown) with GNU 13.3.0 for Linux x86_64
+0.00.055.213 I cmn  common_param: common_params_print_info: verbosity = 4 (adjust with the `-lv N` CLI arg)
+0.00.055.213 I cmn  common_param: device_info:
+0.00.219.517 I cmn  common_param:   - CUDA0   : NVIDIA GeForce RTX 3060 (11911 MiB, 5780 MiB free)
+0.00.412.935 I cmn  common_param:   - CUDA1   : NVIDIA GeForce RTX 3060 (11911 MiB, 3956 MiB free)
+0.00.590.161 I cmn  common_param:   - CUDA2   : NVIDIA GeForce RTX 3060 (11908 MiB, 3215 MiB free)
+0.00.590.193 I cmn  common_param:   - CPU     : Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz (48010 MiB, 48010 MiB free)
+0.00.590.290 I cmn  common_param: system_info: n_threads = 17 (n_threads_batch = 17) / 18 | CUDA : ARCHS = 860 | USE_GRAPHS = 1 | FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.590.927 I srv          init: using 17 threads for HTTP server
+0.00.590.995 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.593.537 I srv    load_model: loading model '/path/to/Nemotron3Super/model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS-tpfit.gguf'
+0.00.593.540 I srv    load_model: local path '/path/to/Nemotron3Super/model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS-tpfit.gguf'
+0.00.819.853 I llama_model_loader: loaded meta data with 51 key-value pairs and 843 tensors from /path/to/Nemotron3Super/model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS-tpfit.gguf (version GGUF V3 (latest))
+0.00.819.921 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.00.819.942 I llama_model_loader: - kv   0:                       general.architecture str              = nemotron_h_moe
+0.00.819.943 I llama_model_loader: - kv   1:                               general.type str              = model
+0.00.819.951 I llama_model_loader: - kv   2:                     general.sampling.top_p f32              = 0.950000
+0.00.819.952 I llama_model_loader: - kv   3:                      general.sampling.temp f32              = 1.000000
+0.00.819.953 I llama_model_loader: - kv   4:                               general.name str              = Hf Packed 6226
+0.00.819.954 I llama_model_loader: - kv   5:                            general.version str              = 6226
+0.00.819.955 I llama_model_loader: - kv   6:                           general.basename str              = hf-packed
+0.00.819.955 I llama_model_loader: - kv   7:                         general.size_label str              = 345x8.1B
+0.00.819.958 I llama_model_loader: - kv   8:                 nemotron_h_moe.block_count u32              = 88
+0.00.819.959 I llama_model_loader: - kv   9:              nemotron_h_moe.context_length u32              = 262144
+0.00.819.960 I llama_model_loader: - kv  10:            nemotron_h_moe.embedding_length u32              = 4096
+0.00.819.988 I llama_model_loader: - kv  11:         nemotron_h_moe.feed_forward_length arr[i32,88]      = [0, 2048, 0, 1536, 0, 2048, 0, 0, 230...
+0.00.819.989 I llama_model_loader: - kv  12:        nemotron_h_moe.attention.head_count u32              = 32
+0.00.819.998 I llama_model_loader: - kv  13:     nemotron_h_moe.attention.head_count_kv arr[i32,88]      = [0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, ...
+0.00.820.001 I llama_model_loader: - kv  14: nemotron_h_moe.attention.layer_norm_rms_epsilon f32              = 0.000010
+0.00.820.002 I llama_model_loader: - kv  15: nemotron_h_moe.attention.layer_norm_epsilon f32              = 0.000010
+0.00.820.003 I llama_model_loader: - kv  16:                nemotron_h_moe.expert_count u32              = 496
+0.00.820.004 I llama_model_loader: - kv  17:          nemotron_h_moe.expert_group_count u32              = 1
+0.00.820.005 I llama_model_loader: - kv  18:     nemotron_h_moe.expert_group_used_count u32              = 1
+0.00.820.005 I llama_model_loader: - kv  19:          nemotron_h_moe.expert_gating_func u32              = 2
+0.00.820.006 I llama_model_loader: - kv  20:                  nemotron_h_moe.vocab_size u32              = 131072
+0.00.820.007 I llama_model_loader: - kv  21:        nemotron_h_moe.rope.dimension_count u32              = 128
+0.00.820.008 I llama_model_loader: - kv  22:             nemotron_h_moe.ssm.conv_kernel u32              = 4
+0.00.820.008 I llama_model_loader: - kv  23:              nemotron_h_moe.ssm.state_size u32              = 128
+0.00.820.009 I llama_model_loader: - kv  24:             nemotron_h_moe.ssm.group_count u32              = 8
+0.00.820.010 I llama_model_loader: - kv  25:              nemotron_h_moe.ssm.inner_size u32              = 8192
+0.00.820.011 I llama_model_loader: - kv  26:          nemotron_h_moe.ssm.time_step_rank u32              = 128
+0.00.820.012 I llama_model_loader: - kv  27:      nemotron_h_moe.rope.scaling.finetuned bool             = false
+0.00.820.013 I llama_model_loader: - kv  28:        nemotron_h_moe.attention.key_length u32              = 128
+0.00.820.014 I llama_model_loader: - kv  29:      nemotron_h_moe.attention.value_length u32              = 128
+0.00.820.022 I llama_model_loader: - kv  30:  nemotron_h_moe.expert_feed_forward_length arr[i32,88]      = [0, 2048, 0, 1536, 0, 2048, 0, 0, 230...
+0.00.820.030 I llama_model_loader: - kv  31:           nemotron_h_moe.expert_used_count arr[i32,88]      = [0, 9, 0, 9, 0, 9, 0, 0, 9, 0, 9, 0, ...
+0.00.820.030 I llama_model_loader: - kv  32: nemotron_h_moe.expert_shared_feed_forward_length u32              = 5376
+0.00.820.031 I llama_model_loader: - kv  33:         nemotron_h_moe.expert_shared_count u32              = 1
+0.00.820.032 I llama_model_loader: - kv  34:         nemotron_h_moe.expert_weights_norm bool             = true
+0.00.820.033 I llama_model_loader: - kv  35:        nemotron_h_moe.expert_weights_scale f32              = 5.000000
+0.00.820.034 I llama_model_loader: - kv  36:             nemotron_h_moe.moe_latent_size u32              = 1024
+0.00.820.035 I llama_model_loader: - kv  37:                       tokenizer.ggml.model str              = gpt2
+0.00.820.036 I llama_model_loader: - kv  38:                         tokenizer.ggml.pre str              = pixtral
+0.00.846.191 I llama_model_loader: - kv  39:                      tokenizer.ggml.tokens arr[str,131072]  = ["<unk>", "<s>", "</s>", "[INST]", "[...
+0.00.851.939 I llama_model_loader: - kv  40:                  tokenizer.ggml.token_type arr[i32,131072]  = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, ...
+0.00.894.487 I llama_model_loader: - kv  41:                      tokenizer.ggml.merges arr[str,269443]  = ["Ġ Ġ", "Ġ t", "e r", "i n", "Ġ �...
+0.00.894.491 I llama_model_loader: - kv  42:                tokenizer.ggml.bos_token_id u32              = 1
+0.00.894.492 I llama_model_loader: - kv  43:                tokenizer.ggml.eos_token_id u32              = 11
+0.00.894.492 I llama_model_loader: - kv  44:            tokenizer.ggml.unknown_token_id u32              = 0
+0.00.894.493 I llama_model_loader: - kv  45:            tokenizer.ggml.padding_token_id u32              = 11
+0.00.894.494 I llama_model_loader: - kv  46:               tokenizer.ggml.add_bos_token bool             = false
+0.00.894.494 I llama_model_loader: - kv  47:               tokenizer.ggml.add_eos_token bool             = false
+0.00.894.508 I llama_model_loader: - kv  48:                    tokenizer.chat_template str              = {% macro render_extra_keys(json_dict,...
+0.00.894.509 I llama_model_loader: - kv  49:               general.quantization_version u32              = 2
+0.00.894.510 I llama_model_loader: - kv  50:                          general.file_type u32              = 18
+0.00.894.514 I llama_model_loader: - type  f32:  489 tensors
+0.00.894.514 I llama_model_loader: - type q3_K:   80 tensors
+0.00.894.515 I llama_model_loader: - type q6_K:  114 tensors
+0.00.894.515 I llama_model_loader: - type iq2_xxs:  160 tensors
+0.00.894.518 I print_info: file format = GGUF V3 (latest)
+0.00.894.519 I print_info: file type   = Q6_K
+0.00.894.524 I print_info: file size   = 19.57 GiB (2.27 BPW) 
+0.00.894.559 I llama_prepare_model_devices: skipping CPU (Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz) for tensor parallelism
+0.00.894.560 I llama_prepare_model_devices: creating a Meta device for tensor parallelism from 3 devices:
+0.00.894.560 I llama_prepare_model_devices: - device 0: CUDA0 (NVIDIA GeForce RTX 3060)
+0.00.894.561 I llama_prepare_model_devices: - device 1: CUDA1 (NVIDIA GeForce RTX 3060)
+0.00.894.561 I llama_prepare_model_devices: - device 2: CUDA2 (NVIDIA GeForce RTX 3060)
+0.00.907.068 I llama_prepare_model_devices: using device Meta() (Meta()) (unknown id) - 12952 MiB free
+0.01.090.422 I load: 0 unused tokens
+0.01.114.899 I load: printing all EOG tokens:
+0.01.114.903 I load:   - 2 ('</s>')
+0.01.114.903 I load:   - 11 ('<|im_end|>')
+0.01.115.200 I load: special tokens cache size = 1000
+0.01.190.241 I load: token to piece cache size = 0.8498 MB
+0.01.190.272 I print_info: arch                  = nemotron_h_moe
+0.01.190.273 I print_info: vocab_only            = 0
+0.01.190.273 I print_info: no_alloc              = 0
+0.01.190.274 I print_info: n_ctx_train           = 262144
+0.01.190.276 I print_info: n_embd_inp            = 4096
+0.01.190.276 I print_info: n_embd                = 4096
+0.01.190.277 I print_info: n_embd_out            = 4096
+0.01.190.278 I print_info: n_layer               = 88
+0.01.190.278 I print_info: n_layer_all           = 88
+0.01.190.289 I print_info: n_head                = 32
+0.01.190.299 I print_info: n_head_kv             = [0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+0.01.190.300 I print_info: n_rot                 = 128
+0.01.190.301 I print_info: n_swa                 = 0
+0.01.190.302 I print_info: is_swa_any            = 0
+0.01.190.303 I print_info: non_causal_type       = 0
+0.01.190.303 I print_info: n_embd_head_k         = 128
+0.01.190.303 I print_info: n_embd_head_v         = 128
+0.01.190.311 I print_info: n_gqa                 = [0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+0.01.190.326 I print_info: n_embd_k_gqa          = [0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+0.01.190.335 I print_info: n_embd_v_gqa          = [0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+0.01.190.337 I print_info: f_norm_eps            = 1.0e-05
+0.01.190.338 I print_info: f_norm_rms_eps        = 1.0e-05
+0.01.190.338 I print_info: f_clamp_kqv           = 0.0e+00
+0.01.190.339 I print_info: f_max_alibi_bias      = 0.0e+00
+0.01.190.339 I print_info: f_logit_scale         = 0.0e+00
+0.01.190.339 I print_info: f_attn_scale          = 0.0e+00
+0.01.190.340 I print_info: f_attn_value_scale    = 0.0000
+0.01.190.347 I print_info: n_ff                  = [0, 2048, 0, 1536, 0, 2048, 0, 0, 2304, 0, 2304, 0, 2048, 0, 2048, 0, 0, 2304, 0, 2048, 0, 2560, 0, 2304, 0, 0, 2048, 0, 2304, 0, 2560, 0, 2304, 0, 2304, 0, 0, 2304, 0, 2048, 0, 2304, 0, 2560, 0, 2560, 0, 0, 2560, 0, 2560, 0, 2304, 0, 2304, 0, 2560, 0, 0, 2048, 0, 2304, 0, 2304, 0, 2048, 0, 2048, 0, 0, 2048, 0, 2304, 0, 2304, 0, 2560, 0, 0, 2560, 0, 2560, 0, 2560, 0, 2560, 0, 2560]
+0.01.190.348 I print_info: n_expert              = 496
+0.01.190.348 I print_info: n_expert_used         = 0
+0.01.190.349 I print_info: n_expert_groups       = 1
+0.01.190.349 I print_info: n_group_used          = 1
+0.01.190.349 I print_info: causal attn           = 1
+0.01.190.350 I print_info: pooling type          = -1
+0.01.190.350 I print_info: rope type             = -1
+0.01.190.350 I print_info: rope scaling          = linear
+0.01.190.352 I print_info: freq_base_train       = 10000.0
+0.01.190.352 I print_info: freq_scale_train      = 1
+0.01.190.353 I print_info: n_ctx_orig_yarn       = 262144
+0.01.190.353 I print_info: rope_yarn_log_mul     = 0.0000
+0.01.190.354 I print_info: rope_finetuned        = unknown
+0.01.190.354 I print_info: ssm_d_conv            = 4
+0.01.190.355 I print_info: ssm_d_inner           = 8192
+0.01.190.355 I print_info: ssm_d_state           = 128
+0.01.190.355 I print_info: ssm_dt_rank           = 128
+0.01.190.356 I print_info: ssm_n_group           = 8
+0.01.190.356 I print_info: ssm_dt_b_c_rms        = 0
+0.01.190.357 I print_info: model type            = 75B.A9B
+0.01.190.358 I print_info: model params          = 74.04 B
+0.01.190.359 I print_info: general.name          = Hf Packed 6226
+0.01.190.359 I print_info: f_embedding_scale     = 0.000000
+0.01.190.360 I print_info: f_residual_scale      = 0.000000
+0.01.190.360 I print_info: f_attention_scale     = 0.000000
+0.01.190.361 I print_info: n_ff_shexp            = 5376
+0.01.190.365 I print_info: vocab type            = BPE
+0.01.190.366 I print_info: n_vocab               = 131072
+0.01.190.366 I print_info: n_merges              = 269443
+0.01.190.367 I print_info: BOS token             = 1 '<s>'
+0.01.190.368 I print_info: EOS token             = 11 '<|im_end|>'
+0.01.190.368 I print_info: EOT token             = 11 '<|im_end|>'
+0.01.190.368 I print_info: UNK token             = 0 '<unk>'
+0.01.190.369 I print_info: PAD token             = 11 '<|im_end|>'
+0.01.190.369 I print_info: LF token              = 1010 'Ċ'
+0.01.190.370 I print_info: EOG token             = 2 '</s>'
+0.01.190.370 I print_info: EOG token             = 11 '<|im_end|>'
+0.01.190.371 I print_info: max token length      = 150
+0.01.214.785 I load_tensors: loading model tensors, this can take a while... (load_mode = mmap)
+[SPLIT-GRAN] blk.0.ssm_in.weight              axis=1 blck(ref)=256 blck(self)=256 g=[1024] nseg=5 is_recr=1 m_up=0 m_down=0 m_gate=0
+[SPLIT-GRAN] blk.1.ffn_down_exps.weight       axis=0 blck(ref)=256 blck(self)=256 g=[256] nseg=1 is_recr=0 m_up=0 m_down=1 m_gate=0
+/path/to/llama.cpp/ggml/src/ggml-backend-meta.cpp:1884: GGML_ASSERT(meta_buf_ctx->bufs[i]) failed
+1.19.549.796 E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 7216.07 MiB on device 0: cudaMalloc failed: out of memory
+1.19.549.810 E ggml_backend_buft_alloc_buffer_n_default: failed to allocate CUDA0 buffer of size 7566600576
+[New LWP 1962772]
+[New LWP 1962771]
+[New LWP 1962770]
+[New LWP 1962769]
+[New LWP 1962768]
+[New LWP 1962767]
+[New LWP 1962766]
+[New LWP 1962765]
+[New LWP 1962764]
+[New LWP 1962763]
+[New LWP 1962762]
+[New LWP 1962761]
+[New LWP 1962760]
+[New LWP 1962759]
+[New LWP 1962758]
+[New LWP 1962757]
+[New LWP 1962756]
+[New LWP 1962755]
+[New LWP 1962751]
+[New LWP 1962750]
+[New LWP 1962748]
+[New LWP 1962747]
+[New LWP 1962745]
+[New LWP 1962744]
+[New LWP 1962743]
+[New LWP 1962742]
+[New LWP 1962741]
+[New LWP 1962740]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+0x0000766849d10813 in __GI___wait4 (pid=1963808, stat_loc=0x0, options=0, usage=0x0) at ../sysdeps/unix/sysv/linux/wait4.c:30
+warning: 30	../sysdeps/unix/sysv/linux/wait4.c: 没有那个文件或目录
+#0  0x0000766849d10813 in __GI___wait4 (pid=1963808, stat_loc=0x0, options=0, usage=0x0) at ../sysdeps/unix/sysv/linux/wait4.c:30
+30	in ../sysdeps/unix/sysv/linux/wait4.c
+#1  0x000076684a316c83 in ggml_print_backtrace () from /path/to/llama.cpp/build-nccl/bin/libggml-base.so.0
+#2  0x000076684a316e2b in ggml_abort () from /path/to/llama.cpp/build-nccl/bin/libggml-base.so.0
+#3  0x000076684a345554 in ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type*, ggml_tensor**, int) () from /path/to/llama.cpp/build-nccl/bin/libggml-base.so.0
+#4  0x000076684a32e38d in ggml_backend_alloc_ctx_tensors_from_buft () from /path/to/llama.cpp/build-nccl/bin/libggml-base.so.0
+#5  0x00007668492febb7 in llama_model_base::load_tensors(llama_model_loader&) () from /path/to/llama.cpp/build-nccl/bin/libllama.so.0
+#6  0x00007668491f0474 in llama_model_load(gguf_context*, void (*)(ggml_tensor*, void*), void*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >&, _IO_FILE*, llama_model_params&) () from /path/to/llama.cpp/build-nccl/bin/libllama.so.0
+#7  0x00007668491f1555 in llama_model_load_from_file_impl(gguf_context*, void (*)(ggml_tensor*, void*), void*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >&, _IO_FILE*, llama_model_params) () from /path/to/llama.cpp/build-nccl/bin/libllama.so.0
+#8  0x00007668491f18fd in llama_model_load_from_file () from /path/to/llama.cpp/build-nccl/bin/libllama.so.0
+#9  0x0000766849848aba in common_init_result::common_init_result(common_params&, bool) () from /path/to/llama.cpp/build-nccl/bin/libllama-common.so.0
+#10 0x000076684984a70c in common_init_from_params(common_params&, bool) () from /path/to/llama.cpp/build-nccl/bin/libllama-common.so.0
+#11 0x000076684a579a5a in server_context_impl::load_model(common_params&) () from /path/to/llama.cpp/build-nccl/bin/libllama-server-impl.so
+#12 0x000076684a4cfd8f in llama_server(common_params&, int, char**, server_child&) () from /path/to/llama.cpp/build-nccl/bin/libllama-server-impl.so
+#13 0x000076684a4d1291 in llama_server(int, char**) () from /path/to/llama.cpp/build-nccl/bin/libllama-server-impl.so
+#14 0x0000766849c2a1ca in __libc_start_call_main (main=main@entry=0x56f2dc412270 <main>, argc=argc@entry=31, argv=argv@entry=0x7ffef9d1e4f8) at ../sysdeps/nptl/libc_start_call_main.h:58
+warning: 58	../sysdeps/nptl/libc_start_call_main.h: 没有那个文件或目录
+#15 0x0000766849c2a28b in __libc_start_main_impl (main=0x56f2dc412270 <main>, argc=31, argv=0x7ffef9d1e4f8, init=<optimized out>, fini=<optimized out>, rtld_fini=<optimized out>, stack_end=0x7ffef9d1e4e8) at ../csu/libc-start.c:360
+warning: 360	../csu/libc-start.c: 没有那个文件或目录
+#16 0x000056f2dc4122a5 in _start ()
+[Inferior 1 (process 1962734) detached]
