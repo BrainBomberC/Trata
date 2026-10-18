@@ -8,7 +8,9 @@
 ## 1. llama.cpp（补丁的上游）
 
 - 项目：https://github.com/ggml-org/llama.cpp
-- 本仓库钉定的上游 commit：`69f201a2051ea9b9e9b50c3cc56afd9e2ae64414`
+- 本仓库钉定的上游 commit：
+  - 生产组（补丁 0005）：`5aeac37a35b44fde4bdffaec9159f2fcb253b622`
+  - 回退组（补丁 0001–0004）：`69f201a2051ea9b9e9b50c3cc56afd9e2ae64414`
 - 许可：MIT
 - 版权：`Copyright (c) 2023-2026 The ggml authors`
 
@@ -98,8 +100,9 @@ OFL 允许嵌入与再分发，但**不允许单独售卖字体**；若修改字
 - 量化文件托管：https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF
 - 镜像：https://modelscope.cn/models/unsloth/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF
 
-**本仓库不包含、不分发任何模型权重。** 权重、量化文件以及由
-`scripts/quantize-tpfit.sh` 生成的再量化文件，均受 NVIDIA 模型许可证
+**本仓库不包含、不分发任何模型权重。** 主模型、DFlash 草稿模型
+（`dflash-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4.gguf`）、视觉投影器，
+以及由 `scripts/quantize-tpfit.sh` 生成的再量化文件，均受 NVIDIA 模型许可证
 与量化发布者条款约束。下载、使用、商用前请阅读模型页面的原始许可证。
 本仓库的 MIT 许可**不覆盖**模型权重。
 

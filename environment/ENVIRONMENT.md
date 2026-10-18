@@ -13,28 +13,41 @@ Python 只用于：下载脚本之外的辅助工具（并发生成类型清单�
 | GPU | NVIDIA，sm_86 或更新 | 3 × RTX 3060 12 GB |
 | 驱动 | 支持 CUDA 12.x | 595.58.03 |
 | NCCL | 2.x，含 `libnccl.so.2` | 来自 `nvidia-nccl-cu12` wheel |
-| llama-server | 打了 4 个补丁的构建 | `llama.cpp/build-nccl/bin/` |
+| llama-server（生产） | 上游 `5aeac37` + 补丁 0005，支持 LiLiCorr | `llama.cpp/build-nccl/bin/` |
+| llama-server（回退） | 上游 `69f201a` + 补丁 0001–0004，支持 TP | 同一路径（二选一） |
 
 启动前：
 
 ```bash
 export NCCL_DIR="$HOME/nccl-venv/lib/python3.12/site-packages/nvidia/nccl"
 export LD_LIBRARY_PATH="$NCCL_DIR/lib:$PWD/llama.cpp/build-nccl/bin:$LD_LIBRARY_PATH"
+# 只有 -sm tensor 需要：
 export LLAMA_SM_TENSOR_ALLOW_ARCH=1
 ```
 
-`scripts/run-tp.sh` 已自动处理，并会在 `~/nccl-venv` 下自动探测 NCCL。
+`scripts/run-draft.sh`（生产）和 `scripts/run-tp.sh`（回退）都会自动探测 NCCL、
+设置 `LD_LIBRARY_PATH`，并导出 `LLAMA_SM_TENSOR_ALLOW_ARCH=1`
+（只有 `-sm tensor` 真正用到，层切分设了也无害）。
 
 ### 1.1 为什么 NCCL 这么关键
 
-张量并行每层都要 all-reduce。没有 NCCL 时退化成主机内存搬运：
+**回退配置**（张量并行）每层都要 all-reduce。没有 NCCL 时退化成主机内存搬运：
 
 | 配置 | 200K prefill |
 |---|---:|
 | 有 NCCL | 781 tok/s |
 | 无 NCCL | 185 tok/s |
 
+**生产配置**（层切分）不做集合通信，但二进制仍链接了 NCCL，
+所以启动时也要能找到 `libnccl.so.2`。
+
 编译时 `-DGGML_CUDA_NCCL=ON`，运行时 `ldd ... | grep nccl` 必须有输出。
+
+### 1.2 草稿模型
+
+生产配置额外需要 `model/draft/dflash-…-NVFP4.gguf`（998 MB）。
+它只放 GPU 才有效（`-ngld all`）；放 CPU 实测 21.9 tok/s，低于不用草稿。
+草稿不需要单独的 CUDA 环境，和主模型共用同一个 `llama-server`。
 
 ---
 

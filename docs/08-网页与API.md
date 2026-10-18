@@ -29,7 +29,7 @@ serve-ui.py  ── 静态文件 ui/strata/（Trata 前端）
       │        ── Strata 形状的 /health /metrics /settings
       │        ── 代理 /v1/chat/completions、/v1/messages、/v1/models ...
       ▼  :8080
-llama-server（3 卡 TP + 1M）
+llama-server（层切分或 TP + 1M，可带 DFlash 草稿）
 ```
 
 ---
@@ -63,7 +63,7 @@ http://<局域网IP>:8001          # 同一局域网的其他电脑
 ### 2.1 用脚本
 
 ```bash
-bash scripts/start-ui.sh                 # 后台启动，日志 /tmp/trata-ui.log
+bash scripts/start-ui.sh                 # 后台启动，日志 model/trata-ui.log
 bash scripts/start-ui.sh --foreground    # 前台
 bash scripts/start-ui.sh --status
 bash scripts/start-ui.sh --stop
@@ -201,7 +201,8 @@ curl -s http://127.0.0.1:8001/v1/messages \
 ```
 
 > 如果返回 404 / `not supported`，说明当前 llama.cpp 构建没有开 Anthropic 兼容层。
-> 本项目钉的 `69f201a` 已包含 `/v1/messages`；换 commit 后需要重新确认。
+> 本项目钉的两个基线（生产 `5aeac37`、回退 `69f201a`）都已包含 `/v1/messages`；
+> 换 commit 后需要重新确认。
 
 ---
 
@@ -288,7 +289,7 @@ ssh -L 8001:127.0.0.1:8001 user@server
 | 有回复但 tok/s 为 `–` | 后端没加 `--metrics` | 启动参数补上 |
 | `/monitor` 没有请求 | 请求走了 8080 直连 | 改为走 8001 |
 | 局域网访问不了 | 监听在 127.0.0.1 / 防火墙 | `--host 0.0.0.0` + 放行端口 |
-| 图片上传报错 | 没加载 mmproj | 加 `-mm`，确认 0004 补丁 |
+| 图片上传报错 | 没加载 mmproj | 加 `-mm`；回退引擎需 0004 补丁，生产引擎已内置 |
 | `Address already in use` | 端口被占 | `ss -ltnp \| grep 8001`，换端口 |
 
 ---

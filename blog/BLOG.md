@@ -3,7 +3,8 @@
 > 一台 2016 年的 Xeon 工作站 + 三张 12 GB 消费级显卡 + 46.9 GiB 内存 + 一块 43 MB/s 的 USB2 硬盘。
 > 目标模型：NVIDIA **Nemotron-3.5-Bolt-74B-A9B**（`nemotron_h_moe`，74B 总参数、9B 激活）。
 >
-> 结果：**层切分 40.3 tok/s（200K 上下文）**，**自研张量并行移植 46.4 tok/s**，**4 路并发聚合 82.9 tok/s**。
+> 结果：**层切分 + NVIDIA DFlash 草稿模型 @1M 上下文 = 54.0–55.0 tok/s**（当前生产）；
+> 回退配置（自研张量并行移植 + 1M、无草稿）46.6–47.7 tok/s；4 路并发聚合 82.9 tok/s。
 > 本文把每一步的算术、改动、数据、以及"为什么到不了 70-100"都摊开写。
 
 ---
@@ -12,8 +13,8 @@
 
 | 章节 | 你会看到什么 | 适合谁 |
 |---|---|---|
-| **一、第一性原理** | 自回归解码到底在花什么时间；层切分 vs 张量并行的带宽算术；显存/内存/磁盘三级存储的判据；这个模型为什么特殊（88 层 = 40 SSM + 40 MoE + 8 注意力） | 想理解"为什么快/为什么慢"的人 |
-| **二、适用范围与局限** | 这套方法对哪些硬件、哪些模型有效；单流为什么卡在 46 tok/s；量化换速度的边界；明确列出"本机做不到 70-100"的证据 | 想判断"我的机器能不能复刻"的人 |
+| **一、第一性原理** | 自回归解码到底在花什么时间；层切分 vs 张量并行的带宽算术；投机解码为什么能摊薄权重读取；显存/内存/磁盘三级存储的判据；这个模型为什么特殊（88 层 = 40 SSM + 40 MoE + 8 注意力） | 想理解"为什么快/为什么慢"的人 |
+| **二、适用范围与局限** | 这套方法对哪些硬件、哪些模型有效；单流不用草稿为什么卡在 46–47、草稿如何绕到 54–55；量化换速度的边界；明确列出"本机做不到 70-100"的证据 | 想判断"我的机器能不能复刻"的人 |
 | **三、从 0 到 1 的部署流程** | 九步：测机器 → 选量化 → 编译引擎 → 打补丁 → 下载校验 → 量化 → 启动 → 测速 → 做成服务；**每一步要改哪个文件、哪个环境变量** | 想动手复刻的人 |
 | **四、实测数据总表** | 所有量化/切分/参数组合的速度、预填充、PPL；kernel 级成本拆解；负结果（哪些优化试过但没用） | 想评估收益/避免踩坑的人 |
 | **五、如何使用** | 网页控制台、OpenAI 兼容 API、并发、监控指标从哪来 | 想直接用的人 |
@@ -162,6 +163,44 @@ token → [卡0: 第0-29层] → [卡1: 第30-58层] → [卡2: 第59-88层] →
 这条公式在开工第一天就把 120B 判了死刑：专家集合 46.4 GiB > 可用内存 42 GiB，
 每 token 必然掉 USB2 盘，理论 0.05 tok/s —— 与后来实测的 0.04 tok/s 完全吻合。
 
+## 1.7 投机解码：把"每 token 读一遍权重"摊开
+
+decode 的本质是：**生成 1 个 token，就要把稠密权重完整读一遍**。谁也没法让这次读取变快，
+但可以让它**一次多产出几个 token**。
+
+投机解码（speculative decoding）的做法：
+
+1. 一个很小的**草稿模型**先连续猜 `n_max` 个 token；
+2. 大模型把这些猜测拼成一个批次，**一次前向**同时算出每个位置"如果是自己会输出什么"；
+3. 从第一个位置开始比对，相同就接受，第一个不同就用大模型的结果替换并停止。
+
+```
+加速比 ≈ (1 + 接受长度) / 1.2
+```
+
+本机用 NVIDIA 官方的 **DFlash** 草稿（1.11 B，`block_size=8`，只在目标第
+`[2,19,36,52,69,86]` 层读取隐藏状态），1M 上下文 + `n_max=4` 实测：
+
+| 项 | 数值 |
+|---|---:|
+| 接受长度 | 3.42 |
+| 无草稿（层切分 @1M） | 40–47 tok/s |
+| 有草稿（层切分 @1M） | **54.0–55.0 tok/s** |
+| 温度 0.7 | 49–52 tok/s |
+
+**为什么它能无损**：验证不是"让小模型打分"，而是大模型用自己的分布重新算一遍。
+greedy 下被接受的 token 与不用草稿时**逐字节相同**；采样模式下 rejection sampling
+保证输出分布不变。实测同一段代码提示，开/关草稿输出完全一致。
+
+**为什么必须配层切分**：验证批次从 1 个位置变成 `n_max+1 = 5` 个，
+张量并行的 all-reduce 数据量也变成 5 倍，正好吃掉草稿的收益；
+层切分没有集合通信，批次变宽只是激活张量变宽。实测 TP + 草稿 @32K 只有 45.1 tok/s，
+TP + 草稿 @1M 直接 OOM。详见 [docs/12](../docs/12-草稿模型与投机解码.md)。
+
+**代价**：草稿也要把整个 prompt 过一遍，长 prompt 的预填充约慢一倍
+（19K：1269 → 616 tok/s；1M：约 17 分钟 → 30 分钟以上）。
+所以"一次读 200K 文档、只回几十个字"的场景，回退到无草稿的 TP 配置反而总时间更短。
+
 ---
 
 # 二、适用范围与局限
@@ -172,7 +211,7 @@ token → [卡0: 第0-29层] → [卡1: 第30-58层] → [卡2: 第59-88层] →
 |---|---|---|
 | GPU 数量 | ≥2 张才谈得上并行；**≥3 张**才有明显收益 | 单卡没有切分问题 |
 | 单卡显存 | 能放下 `模型/N + KV cache + compute buffer` | 本机 12 GB × 3，N=3 时每卡约 7.5 GB |
-| **KV 头数** | 每张卡至少分到 **1 个 KV 头**，否则 KV 缓存只能每卡镜像 | 本模型只有 **2 个 KV 头** → 3 卡下 KV 镜像，1M 上下文每卡多 2.3 GiB（这是 TP+1M 必须换瘦身模型的原因） |
+| **KV 头数** | 每张卡至少分到 **1 个 KV 头**，否则 KV 缓存只能每卡镜像 | 本模型只有 **2 个 KV 头** → 3 卡下 KV 镜像，1M 上下文每卡多 2.25 GiB（这是生产改用层切分、并因此能放下草稿的原因） |
 | NVLink / P2P | **不需要** | 本机三张 3060 无 NVLink、PCIe Gen3 x8/x4/x8，张量并行照样工作 |
 | 内存 | **模型文件 ≤ 物理内存 − 6~8 GiB** | 这是硬门槛，比显卡更关键 |
 | 磁盘 | 随便多慢都能跑（只影响冷启动） | 本机 43.8 MB/s 的 USB2，冷启动 17–40 分钟 |
@@ -204,7 +243,11 @@ token → [卡0: 第0-29层] → [卡1: 第30-58层] → [卡2: 第59-88层] →
 
 不是"调一调还能救"，是算术上不可能。遇到这种结论要**立刻停手**，别再花时间下载/量化。
 
-## 2.4 单流为什么卡在 46 tok/s（以及为什么到不了 70–100）
+## 2.4 纯张量行为什么卡在 46 tok/s（以及为什么到不了 70–100）
+
+> 这一节分析的是**回退配置**（TP×3、无草稿）。生产配置换了一条路：
+> 层切分 + DFlash 草稿把单流做到 **54–55 tok/s**（见 1.7 与 4.1），
+> 但下面这些"墙"依然解释了为什么单纯靠 TP 到不了 70–100。
 
 用 kernel 级 profiler（`nsys --cuda-graph-trace=node`）测出的每 token 成本：
 
@@ -229,7 +272,9 @@ token → [卡0: 第0-29层] → [卡1: 第30-58层] → [卡2: 第59-88层] →
 |---|---|
 | kernel 融合（跳过 608 个 ADD / 289 个 MUL / 160 个 SCALE 测成本） | 45.78 → 46.6 / 46.04 / 45.97，**全在噪声内**。**已验证跳过确实生效**：跳过 ADD 后模型输出变成乱码（`"\n\n\n01\n\n0"`），但速度不变 → 这些小 kernel 根本不在关键路径上，被 matmul 带宽与屏障等待掩盖了 |
 | 把整个 token 捕获成单张 CUDA graph（含 NCCL，节点 4601） | 能跑通，但 **44.0 tok/s（开归约）/ 56.1（关归约）**，比不捕获**慢 4%** |
-| 投机解码（ngram） | 40.27 → 38.7 / 39.2 / 35.7，**无收益**（本模型无 MTP head） |
+| 投机解码（ngram，无草稿模型） | 40.27 → 38.7 / 39.2 / 35.7，**无收益**（ngram 只能匹配原文重复，本模型也没有 MTP head） |
+| 投机解码（Nano-4B 通用草稿，`draft-simple`） | 未采用：该模式不设置 `n_rs_seq`，混合 Mamba 目标的状态回滚快照无效 |
+| 投机解码（DFlash 专用草稿） | **层切分无草稿约 40–47 → 54–55 tok/s**；相对 TP 回退 46.6–47.7 约 +15%。需要另编一版支持 LiLiCorr 的引擎，见步骤 4 |
 
 **唯一有效的横向扩展是批处理**：4 路并发时聚合 **82.9 tok/s**（每路 24.3）。
 因为固定开销（通信 + 小 kernel）被 4 个序列摊薄了。
@@ -301,19 +346,27 @@ export LD_LIBRARY_PATH="/path/to/site-packages/nvidia/nccl/lib:$PWD/build-nccl/b
 
 ## 步骤 3：确认引擎认不认这个架构（下载前！）
 
-用 7.5 MB 的元数据探针，几秒钟验证：
+用 7.5 MB 的元数据探针，几秒钟验证：仓库里的脚本只读 GGUF 头部
+（元数据 + 张量名/形状/类型），不需要权重。
 
 ```bash
-bash scripts/probe-model-arch.sh model/probe/xxx-00001-of-00003.gguf
+python3 -I scripts/gen-expert-types.py model/probe/<第一个分片>.gguf /tmp/probe.txt --all
+head -40 /tmp/probe.txt
 ```
 
-如果报 `unsupported model architecture` 或张量形状不匹配，**先打补丁再下载**，别等几十 GB 下完。
+确认架构名是 `nemotron_h_moe`、88 层、每层专家数在 240–496 之间，以及注意力层只有 2 个 KV 头。
+架构名或张量形状不对，**先打补丁再下载**，别等几十 GB 下完。
 
 ## 步骤 4：打补丁（本模型必须，普通模型可跳过）
 
-### 4.1 逐层专家数（必打）
+### 4.1 逐层专家数（生产基线已自带，不用打）
 
-`Bolt 的 40 个 MoE 层专家数不同`，而 GGUF 只有标量。改 `src/models/nemotron-h.cpp` 两处（从上游 master 0.7.0 回补）：
+`Bolt 的 40 个 MoE 层专家数不同`（240×12、304×6、368×9、432×10、496×3），
+而 GGUF 元数据只有一个标量。生产基线 `5aeac37` 的上游代码**已经按每层路由器张量的
+实际形状读取专家数**，所以这一项不需要任何补丁。
+
+只有回到回退组（`69f201a`）时才要打 `0001-nemotron-per-layer-expert-count.patch`，
+它做的就是上游现在做的事：
 
 ```cpp
 // 1) 创建张量时，用该层路由器张量的实际形状，而不是标量 n_expert
@@ -325,10 +378,16 @@ build_moe_ffn(..., model.layers[il].ffn_up_exps->ne[2], ...);
 ```
 
 不打会直接报 `check_tensor_dims: tensor 'blk.1.ffn_gate_inp.weight' has wrong shape; expected 4096,496 got 4096,240`。
+**生产组看到这条报错，说明你 checkout 错了基线**，不是少打了补丁。
 
-### 4.2 张量并行（可选，想更快才打）
+### 4.2 张量并行（回退组，0001–0004；基线 `69f201a`）
 
-上游 llama.cpp 的 `llm_arch_supports_sm_tensor()` 对 `NEMOTRON_H_MOE` 返回 `false`。本仓库的移植改了 7 个文件：
+> 注意：这组补丁和下一节的 0005 是**两套基线**，不能打在同一个 checkout 上。
+> 生产走 4.3，只有需要回退到 TP 时才用这组。
+
+上游 llama.cpp 的 `llm_arch_supports_sm_tensor()` 对 `NEMOTRON_H_MOE` 返回 `false`。
+本组四个补丁合计改动 **21 个文件 + 新增 1 个**；其中负责张量并行的
+`0002-tensor-parallel.patch` 改动 **11 个文件**（下表只列关键几处）：
 
 | 文件 | 改动 |
 |---|---|
@@ -351,12 +410,35 @@ d_inner = 8192 = 8 组 × 1024 通道；n_head = 128 头；每组 16 头
 必须切成 **5 段**（z / x / B / C / dt），每段各自的粒度不同；否则视图会跨卡，
 切分推断会报 `GGML_ASSERT(ret.axis != UNKNOWN) failed`。
 
+### 4.3 生产组：LiLiCorr / DFlash 草稿（`0005-lilicorr-dflash.patch`，基线 `5aeac37`）
+
+上游 master 已经能加载 `dflash` 架构，但混合 Mamba + 层切分下仍缺四块拼图：
+
+| 文件 | 改动作用 |
+|---|---|
+| `src/models/mamba-base.cpp` | 草稿验证时 `K=1` 的预填充路径：`K_rs = n_rs_seq (>0)+1`，`K = (n_seq_tokens > K_rs) ? 1 : K_rs` |
+| `src/llama-arch.cpp` | 去掉 `NEMOTRON_H` / `NEMOTRON_H_MOE` 的 TP 门禁（只有回退组需要） |
+| `src/llama-model.cpp` | SSM 权重/状态、`output.weight`、DFlash 相关张量标记为 MIRRORED；`n_head_kv>0` 才计算注意力粒度 |
+| `ggml/src/ggml-backend-meta.cpp` | `GGML_OP_ARANGE` 也走 MIRRORED，否则草稿的 meta 后端图切分失败 |
+
+打完在干净树上应该是：
+
+```bash
+git status --short | wc -l      # 4（生产组）
+```
+
+完整的逐条说明见 [docs/04](../docs/04-补丁说明.md)。
+
 ## 步骤 5：下载并校验（几小时，11.6 MB/s）
 
 ```bash
-EXPECT_SHA=<官方 sha256> PARTS=4 \
-  bash scripts/fetch-bolt-quant.sh <repo> <文件名>
-grep '\[sha256 ✅\]' <日志>      # 必须看到这一行
+# 三个文件各下一次：主模型 / DFlash 草稿 / Bolt 仓库的视觉投影器
+bash scripts/download-model.sh
+PRESET=draft  bash scripts/download-model.sh
+PRESET=mmproj bash scripts/download-model.sh
+
+# 最后统一校验（大小 + SHA + 投影器张量数）
+bash scripts/verify-model.sh --all
 ```
 
 **踩坑**：下载中断后盲目续传过一次，分块大小全对、68 个采样点也全一致，但整体 SHA 不符——
@@ -378,63 +460,83 @@ python3 -I scripts/gen-expert-types.py model/bolt74b/<in>.gguf /tmp/types.txt
 
 ## 步骤 7：启动
 
-### 层切分（默认，简单稳定）
+### 生产：层切分 + DFlash 草稿 + 1M（当前生产配置，需要 0005 补丁）
 
 ```bash
-llama-server -m model/bolt74b/...-IQ2_XXS.gguf \
+llama-server \
+  -m model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS.gguf \
   -ngl all -sm layer -ts 1,1,1 -fa on \
-  -ctk q8_0 -ctv q8_0 -c 204800 -ub 512 -t 17 -np 1 -fit off \
-  --host 127.0.0.1 --port 8080
+  -ctk q4_0 -ctv q4_0 -c 1048576 -ub 64 \
+  -t 17 -np 1 -fit off \
+  -md model/draft/dflash-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4.gguf \
+  -ngld all --spec-type draft-dflash \
+  --spec-draft-n-max 4 --spec-draft-n-min 0 \
+  -mm model/mmproj-BF16.gguf --no-mmproj-offload \
+  --override-kv nemotron_h_moe.context_length=int:1048576 \
+  --metrics --host 127.0.0.1 --port 8080 -lv 3
 ```
 
-### 张量并行 + 1M 上下文（**当前生产配置**，需要 4.2 的补丁）
+实测：**decode 54.0–55.0 tok/s（接受长度 3.42）**；温度 0.7 时 49–52。
+预填充被草稿拖慢约一倍：19K 提示 616 tok/s（无草稿 1269），1M 约 30 分钟以上。
+
+要点：
+
+- 主模型用**原版 IQ2**，不需要 `-tpfit`；
+- `-sm layer` 是前提。TP + 草稿 @32K 只有 45.1 tok/s，TP + 草稿 @1M 直接 OOM；
+- `-ub 64`：1M 下 128/256 会 OOM（验证批次本身就比普通 decode 宽）；
+- 四行草稿参数缺一不可：`-md` / `-ngld` / `--spec-type` / `--spec-draft-n-max`。
+
+### 回退：张量并行 + 1M，无草稿（需要 0001–0004 补丁）
 
 ```bash
 export LD_LIBRARY_PATH="<nccl>/lib:<llama.cpp>/build-nccl/bin:$LD_LIBRARY_PATH"
 export LLAMA_SM_TENSOR_ALLOW_ARCH=1
 
 llama-server \
-  -m model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS-tpfit.gguf \
-  -ngl all -sm tensor -ts 1,1,1 -fa on \
-  -ctk q4_0 -ctv q4_0 -c 1048576 -ub 128 \
+  -m model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS.gguf \
+  -ngl all -sm tensor -ts 1.02,1.02,0.96 -fa on \
+  -ctk q4_0 -ctv q4_0 -c 1048576 -ub 64 \
   -t 17 -np 1 -fit off \
   -mm model/mmproj-BF16.gguf --no-mmproj-offload \
   --override-kv nemotron_h_moe.context_length=int:1048576 \
   --metrics --host 127.0.0.1 --port 8080 -lv 3
 ```
 
-实测：**decode 45.8–46.4 tok/s，三卡同时 95/96/95% 满载**；prefill ≈ 706 tok/s（10K 提示）；
-显存 11.1 / 11.3 / 11.8 GB。对比层切分 @1M：37.5 tok/s、三卡各约 33%（流水线）。
+实测：**decode 46.6–47.7 tok/s，三卡同时满载**；预填充比生产快一倍（长 prompt 场景的优势）。
 
-**为什么必须用 `-tpfit` 这份模型**（两个硬约束）：
+**为什么 TP 的显存更紧**：注意力层只有 **2 个 KV 头**（32 个 Q 头，GQA 16:1）。
+2 个 KV 头分不到 3 张卡上，张量并行只能把 KV 缓存**每卡镜像一份** ——
+1M 上下文下每卡多 **2.3 GiB**，而层切分平均只有 **0.75 GiB**。
+省下来的 1.5 GiB 正好够放草稿（约 0.93 GiB），这是"草稿必须配层切分"的内存原因。
 
-1. **KV 头太少**：注意力层只有 **2 个 KV 头**（32 个 Q 头，GQA 16:1）。2 个 KV 头分不到 3 张卡上，
-   张量并行只能把 KV 缓存**每卡镜像一份** —— 1M 上下文下每卡多 **2.3 GiB**。
-2. 于是每卡预算 = 权重 7.5 GB + 镜像 KV 2.3 GiB + 计算缓冲 1.2 GiB ≈ 11 GB。
-   原版 IQ2（22.0 GB）在 `-ub 128` 下差约 1 GiB 装不下；`-tpfit`（19.58 GB）正好放得下。
-
-**其它约束与回退**：
+**其它对照**：
 
 | 情况 | 配置 | 实测 |
 |---|---|---:|
-| 显存不够、要原版 IQ2 的质量 | `-sm tensor -c 262144`（原生上下文） | 46.8 tok/s |
-| 不需要三卡并行、要最快预填充 | `-sm layer` + IQ2 | 37.5 @1M / 40.3 @200K，prefill 1489 |
-| 更小 ubatch | `-ub 64`（计算缓冲再省 ~0.3 GB） | 速度基本不变 |
+| 200K 上下文、要更好的 KV 精度 | 生产 + `-c 204800 -ctk q8_0 -ctv q8_0` + `n_max=3` | 55.5 tok/s |
+| 超长 prompt、只回少量 token | 回退 `-sm tensor -c 1048576` | 46.6–47.7，prefill 快一倍 |
+| 显存不够 | `-sm layer` 无草稿 / 降 `-c` 到 262144 / KV 换 q4_0 | 40–47 |
+| 关掉草稿做 A/B | 同生产参数去掉四行 `-md`/`--spec-*` | 约 40 tok/s |
 
-> `-ub 256` 在 1M + TP 下会因 KQ mask 变大而 OOM（实测 device 2 申请 1292 MiB 失败）。
+> 1M + TP 下 `-ub 128/256` 会 OOM（compute buffer 与 KQ mask 变大），`-ub 64` 是安全值。
 
 ### 参数说明（每一条都有原因）
 
 | 参数 | 为什么 |
 |---|---|
 | `-ngl all` | 所有权重进 GPU（22 GB / 3 卡装得下） |
-| `-sm layer` / `-sm tensor` | 切分方式，见 1.4 |
+| `-sm layer` / `-sm tensor` | 切分方式，见 1.4。**生产用 layer，回退用 tensor** |
 | `-fa on` | FlashAttention，长上下文必需 |
-| `-ctk/-ctv q8_0` | KV cache 量化；200K 上下文下 q8 只占 850 MiB。（**1M 用 q4_0**，否则装不下） |
-| `-c 204800` | 目标上下文长度（模型原生 262144，可 `--override-kv` 放开到 1M，但质量未验证）。**当前生产用 1048576** |
-| `-ub 512` | 物理批大小，影响 compute buffer。**TP + 1M 时最多 128**（256 会 OOM） |
+| `-ctk/-ctv q4_0` | 1M 上下文的 KV 量化。200K/400K 建议换 `q8_0`（更准，也放得下） |
+| `-c 1048576` | 目标上下文（模型原生 262144，用 `--override-kv` 放开到 1M） |
+| `-ub 64` | 物理批大小，影响 compute buffer。**1M 下 128/256 会 OOM**；200K 可试 256 |
 | `-fit off` | **必须**：否则会先打开模型两次去"拟合显存"，白等一轮 |
 | `-np 1` | 单槽；要多路并发改成 4（见第五章） |
+| `-md <草稿.gguf>` | 草稿模型路径。没有它就没有投机解码 |
+| `-ngld all` | 草稿全部放 GPU；`0`（放 CPU）实测掉到 21.9 tok/s |
+| `--spec-type draft-dflash` | 指定 DFlash 协议，不是通用 `draft-simple` |
+| `--spec-draft-n-max 4` | 每步最多起草 4 个；200K/400K 用 3 更快（见 docs/12） |
+| `--spec-draft-n-min 0` | 允许草稿放弃，避免短回复被拖长 |
 
 ### 用 RAM 和 GPU 一起装模型（当显存不够时）
 
@@ -452,7 +554,8 @@ llama-server \
 
 - `-cmoe` 与张量并行**互斥**（llama.cpp 直接 throw），只能配合层切分；
 - `--moe-cache-mib` 开太大（如 22000）会把某张卡显存吃光，decode 反而掉到 3 tok/s；
-- 专家页在内存里也会被驱逐，需要 `scripts/drop-dense-cache.py` 精准丢稠密张量的页缓存。
+- 专家页在内存里也会被驱逐，需要用 `vmtouch`/`posix_fadvise` 之类的工具
+  精准丢掉稠密张量的页缓存（本机是临时脚本，未随仓库发布）。
 
 ## 步骤 8：测速与质量
 
@@ -472,40 +575,24 @@ curl -s --noproxy '*' http://127.0.0.1:8080/completion -H 'Content-Type: applica
 
 ## 步骤 9：做成服务（对外 8001）
 
+仓库的 `systemd/` 目录里已经有三份可直接改路径的单元：
+
+| 单元 | 作用 |
+|---|---|
+| `bolt-serve.service` | **生产**：层切分 + DFlash 草稿 + 1M |
+| `bolt-serve-tp.service` | **回退**：TP×3 + 1M，无草稿（与生产互斥） |
+| `bolt-strata-ui.service` | Trata 网页 + API 代理（8001） |
+
 ```bash
-# 模型服务（仅本机）
-cat > ~/.config/systemd/user/bolt-serve.service <<'EOF'
-[Unit]
-Description=Bolt 74B inference
-After=network.target
-[Service]
-Type=simple
-Environment=LD_LIBRARY_PATH=<nccl>/lib:<llama.cpp>/build-nccl/bin
-MemorySwapMax=0
-ExecStart=<llama-server> -m <model.gguf> -ngl all -sm layer -ts 1,1,1 -fa on \
-  -ctk q8_0 -ctv q8_0 -c 8192 -ub 512 -t 17 -np 1 -fit off --metrics --port 8080
-Restart=on-failure
-[Install]
-WantedBy=default.target
-EOF
-
-# 网页 + OpenAI 兼容层（对外 0.0.0.0:8001）
-cat > ~/.config/systemd/user/bolt-strata-ui.service <<'EOF'
-[Unit]
-Description=Bolt web UI (Strata-compatible)
-After=network.target
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 -I <repo>/scripts/serve-ui.py --host 0.0.0.0 --port 8001
-Restart=always
-[Install]
-WantedBy=default.target
-EOF
-
+cp systemd/*.service ~/.config/systemd/user/
+# 先按文件头注释把 <仓库路径> / <llama-server> / <NCCL> 改成自己的绝对路径
 systemctl --user daemon-reload
 systemctl --user enable --now bolt-serve.service bolt-strata-ui.service
 sudo loginctl enable-linger $USER      # 不登录也开机自启
 ```
+
+两个模型单元用 `Conflicts=` 互斥，切换时先 `systemctl --user stop` 再 start 另一个。
+详见 [systemd/README.md](../systemd/README.md)。
 
 ---
 
@@ -522,9 +609,17 @@ sudo loginctl enable-linger $USER      # 不登录也开机自启
 | Bolt IQ2 + `-ncmoe 8` | 35.0 | — | — |
 | Bolt IQ2 + ngram 投机 | 38.7 / 39.2 / 35.7 | — | — |
 | Bolt IQ4_XS（43.4 GB，掉盘） | 3.03 → 11 → 14（随缓存策略） | 不可用 | — |
-| **Bolt IQ2，张量并行 3 卡** | **46.37** | 940 tok/s（-37%） | 未测 |
-| **Bolt tpfit，张量并行 + 1M 上下文（当前生产）** | **45.8–46.4** | 706 tok/s（10K 提示） | 未测 |
-| Bolt IQ2，层切分 + 1M 上下文 | 37.5 | — | 未测 |
+| **Bolt IQ2，层切分 + DFlash 草稿 + 1M（当前生产）** | **54.0–55.0**（n_max=4，接受长度 3.42） | 约 460 tok/s（200K，413 s） | 未测 |
+| Bolt 同上，温度 0.7 | 49–52 | — | — |
+| Bolt 同上，1M + n_max=3 | 48.5–50.6 | — | — |
+| Bolt 同上，200K + q8_0 KV + n_max=3 | **55.5** | — | — |
+| Bolt 同上，400K + q8_0 KV + n_max=3 | 55.2 | — | — |
+| Bolt 层切分 + 草稿放 CPU（`-ngld 0`） | 21.9 | — | — |
+| Bolt TP + 草稿 @32K（对照，勿用） | 45.1 | — | — |
+| Bolt TP + 草稿 @1M（对照，勿用） | **OOM** | — | — |
+| **Bolt IQ2，张量并行 3 卡（回退）** | **46.37** | 940 tok/s（-37%） | 未测 |
+| **Bolt IQ2，张量并行 + 1M 上下文（回退）** | **46.6–47.7** | prefill 约为草稿配置的 2 倍 | 未测 |
+| Bolt IQ2，层切分 + 1M 上下文（无草稿对照） | 37.5–40.3 | — | 未测 |
 | Bolt IQ2，张量并行 + 原生 262K | 46.8 | — | 未测 |
 | Bolt 瘦身版（tpfit），层切分 / TP | 35.8 / **46.1** | — | — |
 | Bolt TP，2 卡 | 45.4 | — | — |
@@ -555,6 +650,11 @@ sudo loginctl enable-linger $USER      # 不登录也开机自启
 | `NCCL_P2P_DISABLE=1` | 45.9（无变化） |
 | 4 槽并发（层切分） | 33.2 聚合（比单流还低） |
 | 降量化（每 token −18%）后跑 TP | 46.37 → 46.1（**完全没变**，已在开销墙） |
+| TP + DFlash 草稿 @32K | 45.1（验证批次 5 倍放大 all-reduce，草稿收益被吃光） |
+| TP + DFlash 草稿 @1M | 启动 OOM（CUDA0 分配草稿 944 MB 失败） |
+| 草稿放 CPU（`-ngld 0`） | 21.9（草稿一步变成主机内存瓶颈，比不用草稿还慢） |
+| 1M 下 `n_max=3` | 48.5–50.6（比 `n_max=4` 的 54–55 慢：摊薄不足） |
+| Nano-4B 通用草稿（`draft-simple`） | 未采用（状态回滚快照无效，混合 Mamba 会算错） |
 
 ## 4.4 硬件实测上限
 
@@ -576,7 +676,8 @@ sudo loginctl enable-linger $USER      # 不登录也开机自启
 
 ## 5.1 网页控制台
 
-浏览器打开 `http://<机器IP>:8001/`：外观与交互与 [Strata](https://github.com/Niko1221/Strata) 完全一致。
+浏览器打开 `http://<机器IP>:8001/`：界面是 **Trata**，在 [Strata](https://github.com/Niko1221/Strata)（MIT）
+基础上二次开发——灰紫主题、品牌、进度动效、Monitor 数据对接和本地后端代理都按本项目重做。
 
 - **Chat**：流式对话、思考过程折叠、Markdown、对话列表（存在浏览器本地）
 - **Monitor**：实时 **Decode tok/s** 与 **Prefill tok/s**、每卡 GPU 利用率/显存/温度/功耗、CPU、内存、磁盘、
@@ -603,11 +704,15 @@ curl -N http://<IP>:8001/v1/chat/completions \
 ## 5.3 并发（提高聚合吞吐）
 
 ```bash
-# 4 个槽位、总上下文 16K（每槽 4K）：聚合 ~83 tok/s
+# 回退配置实测：4 个槽位、总上下文 16K（每槽 4K）：聚合 ~83 tok/s
 NP=4 CTX=16384 bash scripts/run-tp.sh
+
+# 生产配置同理，把 run-tp.sh 换成 run-draft.sh（并发数据未单独测）
+NP=4 CTX=16384 bash scripts/run-draft.sh
 ```
 
-注意：这是"4 个人同时聊天"的体验（每路 ~24 tok/s）；单人流式仍然是 46。
+注意：这是"4 个人同时聊天"的体验（每路 ~24 tok/s，回退配置）；单人流式为回退 46 / 生产 54–55。
+4 路并发时草稿的接受率会变化，生产配置建议自己压测后再定 `NP`。
 
 ## 5.4 实时参数是怎么算的
 
@@ -619,12 +724,18 @@ NP=4 CTX=16384 bash scripts/run-tp.sh
 ## 5.5 常用运维命令
 
 ```bash
-bash scripts/run-tp.sh --daemon          # 启动模型（后台，等就绪）
+bash scripts/run-draft.sh --daemon       # 生产：层切分 + 草稿 + 1M（后台，等就绪）
+bash scripts/run-draft.sh --status
+bash scripts/run-draft.sh --stop
+
+bash scripts/run-tp.sh --daemon          # 回退：TP×3 + 1M，无草稿（先 stop 上一个）
 bash scripts/run-tp.sh --status
 bash scripts/run-tp.sh --stop
+
 bash scripts/start-ui.sh                 # 启动网页/API 代理
 bash scripts/start-ui.sh --stop
-journalctl --user -u bolt-serve.service -n 100    # systemd 模型日志
+journalctl --user -u bolt-serve.service -n 100    # systemd 模型日志（生产）
+journalctl --user -u bolt-serve-tp.service -n 100 # systemd 模型日志（回退）
 journalctl --user -u bolt-strata-ui.service -n 50 # systemd 网页日志
 ```
 
@@ -642,21 +753,27 @@ journalctl --user -u bolt-strata-ui.service -n 50 # systemd 网页日志
 ## 附：当前生产配置速查（2026-10-18）
 
 ```
-模型   model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS-tpfit.gguf
-切分   -sm tensor -ts 1,1,1   (环境变量 LLAMA_SM_TENSOR_ALLOW_ARCH=1)
+模型   model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS.gguf      (原版 IQ2，不需要 tpfit)
+草稿   model/draft/dflash-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4.gguf  (998 MB)
+视觉   model/mmproj-BF16.gguf --no-mmproj-offload                      (编码器放 CPU，省显存)
+切分   -sm layer -ts 1,1,1
+投机   -ngld all --spec-type draft-dflash --spec-draft-n-max 4 --spec-draft-n-min 0
 上下文 -c 1048576  -ctk q4_0 -ctv q4_0  --override-kv nemotron_h_moe.context_length=int:1048576
-批     -ub 128   (256 会 OOM：1M 下 KQ mask 变大)
-视觉   -mm model/mmproj-BF16.gguf --no-mmproj-offload   (编码器放 CPU，省显存)
-实测   45.8–46.4 tok/s，三卡 95/96/95%，prefill ≈706 tok/s，显存 11.1/11.3/11.8 GB
+批     -ub 64   (1M 下 128/256 会 OOM)
+引擎   上游 5aeac37 + 补丁 0005
+实测   54.0–55.0 tok/s（接受长度 3.42）；温度 0.7 时 49–52；
+       200K prefill 约 460 tok/s，1M prefill 30 分钟以上
 ```
 
-**为什么是这份模型**：注意力层只有 2 个 KV 头，3 卡无法按头切分 → KV 缓存每卡镜像（1M 下 2.3 GiB）。
-每卡预算被压到 ~11 GB，原版 IQ2 差约 1 GiB，`-tpfit` 刚好放得下。
+**为什么是层切分**：注意力层只有 2 个 KV 头，TP 下 KV 每卡镜像（1M 下 2.25 GiB），
+层切分只有约 0.75 GiB —— 省下的 1.5 GiB 正好放草稿（0.93 GiB）。
+而且草稿每步要验证 5 个位置，TP 的 all-reduce 也放大 5 倍，收益会归零。
 
-**回退**：
+**回退**（TP×3 + 1M，无草稿，引擎是 `69f201a` + 0001–0004）：
 
 | 想要 | 换什么 | 实测 |
 |---|---|---:|
-| 更好的稠密精度 | 原版 IQ2 + `-sm layer`（@1M） | 37.5 tok/s |
-| 同样的 TP 但要原版模型 | `-c 262144`（原生上下文） | 46.8 tok/s |
-| 更快的预填充 | `-sm layer`（prefill 1489 vs 706） | 40.3 @200K |
+| 更快的长 prompt 预填充 | `bash scripts/run-tp.sh --daemon` | 46.6–47.7 tok/s，prefill 约为生产的 2 倍 |
+| 更好的 KV 精度 @200K | 生产 + `-c 204800 -ctk q8_0 -ctv q8_0` + `n_max=3` | 55.5 tok/s |
+| TP + 原生 262K（不追 1M） | `-c 262144` | 46.8 tok/s |
+| A/B 对照：关草稿 | 生产参数去掉 `-md` / `--spec-*` | 约 40 tok/s |

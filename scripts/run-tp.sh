@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# run-tp.sh —— 启动 3 卡张量并行 + 1M 上下文的 llama-server
+# run-tp.sh —— 回退配置：3 卡张量并行 + 1M 上下文（无草稿，46.6–47.7 tok/s）
+#
+# 生产配置请用 scripts/run-draft.sh（层切分 + LiLiCorr 草稿，54–55 tok/s）。
+# 本脚本保留是为了对照、以及在"不想用草稿"时快速回退。
 #
 # 用法:
 #   bash scripts/run-tp.sh                  # 前台运行（Ctrl-C 停止）
@@ -8,42 +11,33 @@
 #   bash scripts/run-tp.sh --stop
 #
 # 常用环境变量:
-#   MODEL   模型路径      默认优先用 -tpfit.gguf，没有则用原版 IQ2_XXS
+#   MODEL   模型路径      默认原版 IQ2_XXS（TP+1M 用 -ub 64 刚好装下）
 #   LLAMA_BIN  llama-server 路径
 #   NCCL_DIR  NCCL 目录（含 lib/libnccl.so.2）
 #   CTX      上下文        默认 1048576
-#   UB       物理批大小    默认 128（1M 下 256 会 OOM）
-#   TS       切分比例      默认 1,1,1
+#   UB       物理批大小    默认 64（1M 下 256 会 OOM）
+#   TS       切分比例      默认 1.02,1.02,0.96（按显存余量微调）
 #   HOST/PORT 监听地址     默认 127.0.0.1:8080
 #   THREADS  CPU 线程      默认 nproc-1
 #   NGL       GPU 层数     默认 all
 #   CTK/CTV  KV 类型       默认 q4_0（1M 用；200K 可改 q8_0）
 #   NP       并发槽位      默认 1；4 路并发用 NP=4（聚合吞吐约 83 tok/s）
-#   MM       mmproj 路径   默认自动探测 model/mmproj-BF16.gguf；设为空可禁用
+#   MM       mmproj 路径   默认 model/mmproj-BF16.gguf（必须是 Bolt 仓库那份）
 #   NO_MMPROJ_OFFLOAD=0    允许视觉编码器上 GPU（默认放 CPU）
 #   EXTRA    追加参数，例如 EXTRA="-lv 3 --metrics"
 #   LOG      后台日志      默认 model/bolt-serve.log
-#
-# 只需要层切分时: SM=layer CTX=204800 UB=512 CTK=q8_0 CTV=q8_0
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${LLAMA_BIN:-$ROOT/llama.cpp/build-nccl/bin/llama-server}"
-TPFIT="$ROOT/model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS-tpfit.gguf"
 ORIG="$ROOT/model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS.gguf"
 
-if [ -n "${MODEL:-}" ]; then
-  :
-elif [ -f "$TPFIT" ]; then
-  MODEL="$TPFIT"
-else
-  MODEL="$ORIG"
-fi
+MODEL="${MODEL:-$ORIG}"
 
 SM="${SM:-tensor}"
 CTX="${CTX:-1048576}"
-UB="${UB:-128}"
-TS="${TS:-1,1,1}"
+UB="${UB:-64}"
+TS="${TS:-1.02,1.02,0.96}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
 NGL="${NGL:-all}"

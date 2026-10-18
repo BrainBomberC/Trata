@@ -1,0 +1,117 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 679d521..113252c 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1001,7 +1001,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             } break;
+             case GGML_OP_PAD_REFLECT_1D:
+             case GGML_OP_ROLL:
+-            case GGML_OP_ARANGE:
++            case GGML_OP_ARANGE: {
++                // 2026-10-18: no tensor sources - the range only depends on op params, so it is
++                // identical on every device (used by the LiLiCorr draft's top-k lattice).
++                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
++            } break;
+             case GGML_OP_TIMESTEP_EMBEDDING: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index ffa35bd..416ac6d 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -1305,8 +1305,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+         case LLM_ARCH_GLM_DSA:
+         case LLM_ARCH_BITNET:
+         case LLM_ARCH_T5:
+-        case LLM_ARCH_NEMOTRON_H:
+-        case LLM_ARCH_NEMOTRON_H_MOE:
+         case LLM_ARCH_GRANITE_HYBRID:
+         case LLM_ARCH_MINIMAX_01:
+         case LLM_ARCH_MINIMAX_M2:
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 803a832..f7381d3 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -417,6 +417,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+     static const std::regex pattern_attn_q_b_weight ("blk\\.\\d*\\.attn_q_b\\.weight");
+     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+ 
++    static const std::regex pattern_ssm_in          ("blk\\.\\d*\\.ssm_in\\.weight");
++    static const std::regex pattern_ssm_d           ("blk\\.\\d*\\.ssm_d\\.weight");
++    static const std::regex pattern_ssm_norm        ("blk\\.\\d*\\.ssm_norm\\.weight");
++    static const std::regex pattern_ssm_conv1d_bias ("blk\\.\\d*\\.ssm_conv1d\\.bias");
+     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
+     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
+     static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
+@@ -495,10 +499,42 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+     };
+ 
+     auto get_tensor_config = [&]() -> tensor_config {
++        if (ud->model->arch == LLM_ARCH_DFLASH) {
++            // 2026-10-18: with -sm tensor the LiLiCorr/DFlash draft inherits the target's split
++            // mode, but its block layout (DFlash blocks + LiLiCorr layers + feature MLP) does not
++            // follow n_layer_all and it shares tensors with the target. Replicate it wholesale.
++            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
++        }
+         if (ud->model->arch == LLM_ARCH_HRM_TEXT) {
+             // aliased cache slots cannot satisfy the meta-split invariants, so replicate all tensors
+             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
+         }
++        if (ud->model->arch == LLM_ARCH_NEMOTRON_H || ud->model->arch == LLM_ARCH_NEMOTRON_H_MOE) {
++            // 2026-10-18: design A for the Nemotron-H Mamba-2 block - replicate the whole SSM block
++            // (weights + conv/SSM state) on every device and shard only attention and MoE.
++            // ggml_ssm_scan is dispatched with scalar_only=true, so every one of its sources must be
++            // MIRRORED; the recurrent cache has to be MIRRORED to match. Rollback snapshots live on
++            // the unsplit cell axis, so n_rs_seq works unchanged.
++            if (std::regex_match(tensor_name, pattern_ssm_in)          ||
++                std::regex_match(tensor_name, pattern_ssm_d)           ||
++                std::regex_match(tensor_name, pattern_ssm_norm)        ||
++                std::regex_match(tensor_name, pattern_ssm_dt)          ||
++                std::regex_match(tensor_name, pattern_ssm_a)           ||
++                std::regex_match(tensor_name, pattern_ssm_alpha)       ||
++                std::regex_match(tensor_name, pattern_ssm_beta)        ||
++                std::regex_match(tensor_name, pattern_ssm_beta_alpha)  ||
++                std::regex_match(tensor_name, pattern_ssm_conv1d)      ||
++                std::regex_match(tensor_name, pattern_ssm_conv1d_bias) ||
++                std::regex_match(tensor_name, pattern_ssm_out_weight)  ||
++                std::regex_match(tensor_name, pattern_r_cache)         ||
++                std::regex_match(tensor_name, pattern_s_cache)         ||
++                // the LiLiCorr draft runs TOP_K over the target logits at the anchor position,
++                // which needs the full vocabulary on every device
++                std::regex_match(tensor_name, pattern_output_weight)) {
++                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++            }
++        }
++
+         if (is_dsv4) {
+             if (std::regex_match(tensor_name, pattern_kv_cache) ||
+                     std::regex_match(tensor_name, pattern_dsv4_state)) {
+@@ -742,7 +778,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+             if (std::regex_match(tensor_name, pattern_s_cache)) {
+                 return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
+             }
+-        } else {
++        } else if (hparams.n_head_kv(il) > 0) {
++            // 2026-10-18: nemotron_h_moe has MoE/Mamba layers without any KV heads
++            // (n_head_kv == 0 -> n_gqa == 0); those must skip the attention math and fall
++            // through to the FFN rules instead of dividing by zero.
+             // regular attention
+             const uint32_t n_gqa    = hparams.n_gqa(il);
+             const uint32_t n_embd_q = n_gqa * hparams.n_embd_head_k(il);
+diff --git a/src/models/mamba-base.cpp b/src/models/mamba-base.cpp
+index 370de0f..0fad4f5 100644
+--- a/src/models/mamba-base.cpp
++++ b/src/models/mamba-base.cpp
+@@ -169,7 +169,11 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
+     const int64_t n_seqs   = ubatch.n_seqs;
+ 
+     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+-    const int64_t K            = cparams.n_rs_seq > 0 ? (int64_t) cparams.n_rs_seq + 1 : 1;
++    const int64_t K_rs         = cparams.n_rs_seq > 0 ? (int64_t) cparams.n_rs_seq + 1 : 1;
++    // 2026-10-18: rollback snapshots are only consumed by speculative-decode verification,
++    // where the ubatch holds at most n_rs_seq+1 tokens per sequence. Large prefill ubatches are
++    // never rolled back, so keep K=1 there to preserve the fast SSD prefill kernel.
++    const int64_t K            = (n_seq_tokens > K_rs) ? 1 : K_rs;
+ 
+     GGML_ASSERT(n_seqs != 0);
+     GGML_ASSERT(ubatch.equal_seqs());

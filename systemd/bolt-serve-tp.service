@@ -1,0 +1,35 @@
+# bolt-serve-tp.service —— 回退配置：3 卡张量并行 + 1M 上下文（无草稿）
+#
+# 实测 46.6–47.7 tok/s，比生产配置（层切分 + 草稿，54–55）慢，但预填充更快。
+# 与 bolt-serve.service 互斥，切换方法：
+#   systemctl --user stop  bolt-serve.service
+#   systemctl --user start bolt-serve-tp.service
+#
+# 注意：
+#   - 需要 NCCL，且引擎要支持 `-sm tensor`（旧版补丁 0001–0004 或 0005 所在的 master 构建）。
+#   - 1M + TP 的显存余量很小，`-ub` 必须 64；原版 IQ2 刚好装下，不需要 tpfit。
+#   - 投影器必须是 Bolt 仓库那份（519 张量）。
+
+[Unit]
+Description=Bolt 74B fallback (tensor parallel x3, 1M, no draft) — 46.6–47.7 tok/s
+After=network.target
+Conflicts=bolt-serve.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Nemotron3Super
+Environment=LD_LIBRARY_PATH=%h/nccl-venv/lib/python3.12/site-packages/nvidia/nccl/lib:%h/Nemotron3Super/llama.cpp/build-nccl/bin
+Environment=LLAMA_SM_TENSOR_ALLOW_ARCH=1
+MemorySwapMax=0
+ExecStart=%h/Nemotron3Super/llama.cpp/build-nccl/bin/llama-server \
+  -m %h/Nemotron3Super/model/bolt74b/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS.gguf \
+  -ngl all -sm tensor -ts 1.02,1.02,0.96 -fa on \
+  -ctk q4_0 -ctv q4_0 -c 1048576 -ub 64 -t 17 -np 1 -fit off \
+  -mm %h/Nemotron3Super/model/mmproj-BF16.gguf --no-mmproj-offload \
+  --override-kv nemotron_h_moe.context_length=int:1048576 \
+  --metrics --host 127.0.0.1 --port 8080 -lv 3
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

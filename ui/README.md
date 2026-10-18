@@ -37,13 +37,14 @@ ui/strata/
 
 ## 2. 相对 Strata 原版的改动
 
-1. **改名 Trata**：标题、页头品牌、Monitor 页；页脚保留 "UI based on Strata" 的出处说明。
+1. **品牌改为 Trata**：标题、页头、Monitor 页；页脚保留 "UI based on Strata" 的出处说明。
 2. **灰紫赛博主题**（`web/tokens.css`）：
    暗色底 `#0f0c17`、紫罗兰强调 `#a78bfa`、青色辅色 `#22d3ee`，卡片紫色辉光。
 3. **进度条动效**（`web/components.css` + `web/app.js`）：
    生成中流动高光；"读提示"阶段用不确定态动画，因为 llama.cpp 不提供 prefill 进度。
 
-前端逻辑（`app.js`）基本保持 Strata 原样，改动集中在品牌、样式和进度显示。
+`app.js` 以 Strata 的聊天/SSE 骨架为基础，按本项目需要改了品牌渲染、
+Monitor 数据对接和生成进度显示；后端代理 `serve-ui.py` 是本项目自己写的。
 
 ---
 
@@ -74,8 +75,11 @@ ui/strata/
 ## 4. 启动
 
 ```bash
-# 先启动 llama-server（8080）
-bash scripts/run-tp.sh --daemon
+# 先启动 llama-server（8080）：生产配置（层切分 + 草稿）
+bash scripts/run-draft.sh --daemon
+# 或者回退配置（张量并行，无草稿）
+# bash scripts/run-tp.sh --daemon
+
 # 再启动网页/API（8001）
 bash scripts/start-ui.sh
 ```

@@ -2,18 +2,23 @@
 # download-model.sh —— 从 ModelScope 分块并行下载 Bolt 74B GGUF，支持断点续传与 SHA256 校验
 #
 # 用法:
-#   bash scripts/download-model.sh                 # 下载默认的 IQ2_XXS
+#   bash scripts/download-model.sh                 # 主模型 IQ2_XXS（22 GB）
+#   PRESET=draft  bash scripts/download-model.sh   # LiLiCorr(DFlash) 草稿（998 MB）
+#   PRESET=mmproj bash scripts/download-model.sh   # Bolt 专用视觉投影器（1.61 GiB）
 #   bash scripts/download-model.sh --check         # 只取远端大小，不下载
-#   FILE=mmproj-BF16.gguf DEST=model bash scripts/download-model.sh
 #
 # 环境变量:
+#   PRESET      main|draft|mmproj  预设（会填好 REPO/FILE/DEST/EXPECT_SHA）
 #   REPO        仓库         默认 unsloth/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF
-#   FILE        文件名       默认 NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS.gguf
-#   DEST        保存目录     默认 <仓库>/model/bolt74b
+#   FILE        文件名       默认随 PRESET
+#   DEST        保存目录     主模型 model/bolt74b、草稿 model/draft、投影器 model
 #   PARTS       分块数       默认 4
-#   EXPECT_SHA  期望 SHA256  默认主模型已知值；换 FILE 时自动置空；显式传空跳过校验
+#   EXPECT_SHA  期望 SHA256  默认随 PRESET；换 FILE 时自动置空；显式传空跳过校验
 #   PROXY       HF 兜底代理  默认空，例如 http://127.0.0.1:7897
 #   FORCE       1 = 跳过磁盘空间检查
+#
+# 重要：视觉投影器有两个同名文件（Bolt 519 张量 / Super-120B 393 张量）。
+#       PRESET=mmproj 会校验 Bolt 那份的 SHA，从错误仓库下的文件会直接失败。
 #
 # 为什么不用 curl --retry 续传:
 #   curl 重试会从该次请求的起点重新下载并追加，导致分块内部重复数据。
@@ -21,8 +26,31 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPO="${REPO:-unsloth/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF}"
+DEFAULT_REPO="unsloth/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF"
 DEFAULT_FILE="NVIDIA-Nemotron-3.5-Bolt-74B-A9B-IQ2_XXS.gguf"
+
+# 预设只填空缺变量，显式传入的环境变量优先
+case "${PRESET:-main}" in
+  main|"") ;;
+  draft)
+    : "${REPO:=$DEFAULT_REPO}"
+    : "${FILE:=dflash-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4.gguf}"
+    : "${DEST:=$ROOT/model/draft}"
+    : "${EXPECT_SHA:=080e1ea41c9562a7804dbf30c6fbd4d17e216c6b8ff666f88e6edb1816010194}"
+    ;;
+  mmproj)
+    : "${REPO:=$DEFAULT_REPO}"
+    : "${FILE:=mmproj-BF16.gguf}"
+    : "${DEST:=$ROOT/model}"
+    : "${EXPECT_SHA:=acad03175d80ce7caea6854795e9ecc978e86d4b4caae0125efba5f970216f4f}"
+    ;;
+  *)
+    echo "未知 PRESET='$PRESET'（可用: main / draft / mmproj）" >&2
+    exit 2
+    ;;
+esac
+
+REPO="${REPO:-$DEFAULT_REPO}"
 FILE="${FILE:-$DEFAULT_FILE}"
 DEST="${DEST:-$ROOT/model/bolt74b}"
 PARTS="${PARTS:-4}"
@@ -32,7 +60,7 @@ DEFAULT_SHA="30c4eac4cdd63a7c73fcf29254a9fd3f40ab7ef09b555c1dd6653140cc94108f"
 
 if [ "${EXPECT_SHA+x}" = "x" ]; then
   :                                   # 用户显式设置（包括空字符串）
-elif [ "$FILE" = "$DEFAULT_FILE" ] && [ "$REPO" = "unsloth/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF" ]; then
+elif [ "$FILE" = "$DEFAULT_FILE" ] && [ "$REPO" = "$DEFAULT_REPO" ]; then
   EXPECT_SHA="$DEFAULT_SHA"
 else
   EXPECT_SHA=""                        # 其它文件不知道 SHA，跳过
@@ -107,6 +135,8 @@ verify_sha() {
   fi
   say "[sha256 FAIL] 期望 $EXPECT_SHA"
   say "              实际 $got"
+  say "  若大小只差几十字节，可能是托管方更新过元数据（见 docs/05 §4.2），"
+  say "  确认张量清单一致后可继续；否则删掉重下。"
   return 1
 }
 
