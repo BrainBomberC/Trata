@@ -3,7 +3,7 @@
 > **模型**：NVIDIA **Nemotron-3.5-Bolt-74B-A9B**（74B 总参数 / 9B 激活，`nemotron_h_moe` 架构）
 > **硬件**：3 × RTX 3060 12 GB（无 NVLink）+ 46.9 GiB 内存 + 普通 SATA/USB 硬盘
 > **结果**：张量并行 3 卡 + 1M 上下文，**decode 45.8–46.4 tok/s**，三卡同时 95%+ 负载；4 路并发聚合 **82.9 tok/s**
-> **项目名**：Trata（Web 前端基于 [Strata](https://github.com/Niko1221/Strata) 改名，见 [ui/README](ui/README.md)）
+> **项目名**：Trata。网页前端 Trata UI 由本项目在 [Strata](https://github.com/Niko1221/Strata)（MIT）基础上二次开发，见 [ui/README](ui/README.md)
 
 这是一个**完整可复刻的部署工程**，不是一份"跑分截图"。仓库里有：
 

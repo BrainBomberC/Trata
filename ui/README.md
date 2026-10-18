@@ -1,7 +1,8 @@
 # ui/ —— Trata 网页前端
 
-`ui/strata/` 是模型服务的浏览器界面。外观与交互来自 **Strata**（MIT），
-本项目改名为 **Trata** 并换了配色，后端由 `scripts/serve-ui.py` 提供。
+`ui/strata/` 是本项目的网页前端 **Trata**。它基于 **Strata**（MIT）二次开发：
+品牌、配色、进度动效与后端适配由本项目完成；目录名保留 `strata` 是为了标明出处。
+后端由 `scripts/serve-ui.py` 提供。
 
 ```
 ui/strata/

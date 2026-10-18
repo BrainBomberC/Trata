@@ -47,8 +47,8 @@ SOFTWARE.
 - 许可：MIT
 - 版权：`Copyright (c) 2026 Niko1221 and the Strata contributors`
 
-`ui/strata/` 中的 HTML/CSS/JS 来自 Strata，本项目将其改名为 **Trata**，
-修改了品牌、配色与少量进度显示逻辑。页面页脚保留了
+`ui/strata/` 中的 HTML/CSS/JS 源自 Strata，本项目在其基础上改造为 **Trata**：
+重做品牌、配色与进度显示逻辑，并适配本项目后端。页面页脚保留了
 “UI based on Strata” 的出处链接。
 
 ```
