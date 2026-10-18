@@ -153,7 +153,7 @@ free -g
 ### 第 1 步：拿到本项目
 
 ```bash
-git clone <你的仓库地址> Nemotron3Super
+git clone https://github.com/BrainBomberC/Trata.git Nemotron3Super
 cd Nemotron3Super
 ```
 
